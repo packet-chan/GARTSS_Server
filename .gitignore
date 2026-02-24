@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test / Cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment
+.env
+.env.local
+
+# Quest data (大容量、リポジトリに含めない)
+data/
+*.raw
+*.ply
+*.pcd
+
+# Output images
+*.jpg
+*.png
+!tests/fixtures/**
+
+# SAM model weights (Phase 3)
+weights/
+*.pth
+*.pt
+*.onnx
