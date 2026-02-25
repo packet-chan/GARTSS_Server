@@ -1,14 +1,19 @@
 """
-AR Work Assist Server
+GARTSS Server
 Quest 3からのRGB+Depthデータを受け取り、3D再投影アライメントを行う。
+キャプチャごとに可視化画像を保存。
 """
 
 import io
 import json
 import uuid
+from pathlib import Path
+
+import cv2
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
 
 from core.alignment import AlignmentEngine
 from models.schemas import (
@@ -18,10 +23,14 @@ from models.schemas import (
     AnalyzeRequest, AnalyzeResponse,
 )
 
+# 保存先ディレクトリ
+OUTPUT_DIR = Path("captures")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
 app = FastAPI(
-    title="AR Work Assist Server",
+    title="GARTSS Server",
     description="Zero-shot AR Authoring - Quest 3 RGB-Depth Alignment",
-    version="0.1.0",
+    version="0.2.0",
 )
 
 app.add_middleware(
@@ -35,6 +44,87 @@ app.add_middleware(
 sessions: dict[str, dict] = {}
 
 
+def save_visualization(session_dir: Path, capture_idx: int, engine: AlignmentEngine,
+                       rgb_bytes: bytes | None, depth_raw: np.ndarray, aligned_depth: np.ndarray):
+    """RGB, Depth(raw), Aligned Depth, Overlay を保存"""
+    prefix = f"cap{capture_idx:03d}"
+
+    # 1. Depth raw (NDC) → カラーマップ
+    depth_vis = cv2.normalize(depth_raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    depth_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_TURBO)
+    cv2.imwrite(str(session_dir / f"{prefix}_depth_raw.png"), depth_colored)
+    print(f"  Saved: {prefix}_depth_raw.png ({depth_raw.shape})")
+
+    # 2. Aligned Depth → カラーマップ
+    valid = aligned_depth[aligned_depth > 0]
+    if len(valid) > 0:
+        vmin, vmax = np.percentile(valid, [2, 98])
+    else:
+        vmin, vmax = 0, 5
+
+    aligned_norm = np.clip((aligned_depth - vmin) / max(vmax - vmin, 0.01), 0, 1)
+    aligned_norm[aligned_depth <= 0] = 0
+    aligned_u8 = (aligned_norm * 255).astype(np.uint8)
+    aligned_colored = cv2.applyColorMap(aligned_u8, cv2.COLORMAP_TURBO)
+    aligned_colored[aligned_depth <= 0] = [0, 0, 0]
+    cv2.imwrite(str(session_dir / f"{prefix}_aligned_depth.png"), aligned_colored)
+    print(f"  Saved: {prefix}_aligned_depth.png ({aligned_depth.shape})")
+
+    # 3. RGB
+    if rgb_bytes is not None and len(rgb_bytes) > 0:
+        try:
+            # まずPNG/JPGとして開いてみる
+            rgb_img = np.array(Image.open(io.BytesIO(rgb_bytes)).convert("RGB"))
+        except Exception:
+            # YUV_420_888 (NV21形式) の生データとして処理
+            h_guess = 1280
+            w_guess = 1280
+            y_size = w_guess * h_guess  # 1638400
+
+            if len(rgb_bytes) >= y_size * 3 // 2:
+                # Y plane + UV interleaved plane
+                yuv_data = np.frombuffer(rgb_bytes[:y_size * 3 // 2], dtype=np.uint8)
+                
+                # OpenCVのcvtColorで変換するため、NV21形式に整形
+                # Y: h*w, UV: h/2 * w (interleaved V,U)
+                nv21 = np.zeros(y_size * 3 // 2, dtype=np.uint8)
+                nv21[:y_size] = yuv_data[:y_size]
+                nv21[y_size:] = yuv_data[y_size:y_size * 3 // 2]
+                nv21 = nv21.reshape((h_guess * 3 // 2, w_guess))
+                
+                # NV21 → BGR
+                rgb_bgr = cv2.cvtColor(nv21, cv2.COLOR_YUV2BGR_NV12)
+                rgb_img = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
+                print(f"  RGB: YUV_420_888 → color ({w_guess}x{h_guess})")
+            else:
+                print(f"  RGB: Unknown format, size={len(rgb_bytes)}")
+                return
+
+        rgb_bgr = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(str(session_dir / f"{prefix}_rgb.png"), rgb_bgr)
+        print(f"  Saved: {prefix}_rgb.png ({rgb_img.shape})")
+
+        # 4. Overlay (RGB + Aligned Depth)
+        h, w = rgb_img.shape[:2]
+        ah, aw = aligned_colored.shape[:2]
+        if (h, w) != (ah, aw):
+            aligned_resized = cv2.resize(aligned_colored, (w, h), interpolation=cv2.INTER_NEAREST)
+            mask = cv2.resize((aligned_depth > 0).astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+        else:
+            aligned_resized = aligned_colored
+            mask = (aligned_depth > 0).astype(np.uint8)
+
+        overlay = rgb_bgr.copy()
+        mask_3ch = np.stack([mask] * 3, axis=-1)
+        overlay = np.where(mask_3ch > 0,
+                           cv2.addWeighted(rgb_bgr, 0.5, aligned_resized, 0.5, 0),
+                           overlay)
+        cv2.imwrite(str(session_dir / f"{prefix}_overlay.png"), overlay)
+        print(f"  Saved: {prefix}_overlay.png")
+    else:
+        print(f"  No RGB image, skipping overlay")
+
+
 @app.post("/session/init", response_model=SessionInitResponse)
 async def session_init(request: SessionInitRequest):
     session_id = str(uuid.uuid4())[:8]
@@ -44,7 +134,19 @@ async def session_init(request: SessionInitRequest):
         image_width=request.image_format.width,
         image_height=request.image_format.height,
     )
-    sessions[session_id] = {"engine": engine, "captures": []}
+
+    # セッション用ディレクトリ作成
+    session_dir = OUTPUT_DIR / session_id
+    session_dir.mkdir(exist_ok=True)
+
+    sessions[session_id] = {
+        "engine": engine,
+        "captures": [],
+        "dir": session_dir,
+        "capture_count": 0,
+    }
+    print(f"\n=== Session {session_id} initialized ===")
+    print(f"  Output dir: {session_dir}")
     return SessionInitResponse(session_id=session_id)
 
 
@@ -56,12 +158,15 @@ async def capture(
     hmd_poses: str = Form(...),
     rgb_image: UploadFile = File(None),
 ):
-    """キャプチャデータを受け取り、RGB-Depthアライメントを実行"""
+    """キャプチャデータを受け取り、RGB-Depthアライメントを実行し、可視化を保存"""
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
     session = sessions[session_id]
     engine: AlignmentEngine = session["engine"]
+    capture_idx = session["capture_count"]
+
+    print(f"\n--- Capture {capture_idx} (session {session_id}) ---")
 
     try:
         desc = DepthDescriptor(**json.loads(depth_descriptor))
@@ -73,6 +178,10 @@ async def capture(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid hmd_poses: {e}")
 
+    print(f"  Depth timestamp: {desc.timestamp_ms}")
+    print(f"  HMD poses: {len(poses)}")
+    print(f"  Depth size: {desc.width}x{desc.height}")
+
     depth_bytes = await depth_raw.read()
     h, w = desc.height, desc.width
     expected_size = h * w * 4
@@ -83,6 +192,8 @@ async def capture(
         )
     depth_array = np.frombuffer(depth_bytes, dtype=np.float32).reshape((h, w))
 
+    print(f"  Depth range: [{depth_array.min():.4f}, {depth_array.max():.4f}]")
+
     # HMDポーズ設定
     engine.set_hmd_poses([p.model_dump() for p in poses])
 
@@ -92,6 +203,7 @@ async def capture(
         raise HTTPException(status_code=400, detail="Cannot interpolate HMD pose")
 
     hmd_pos, hmd_rot = pose
+    print(f"  HMD pos: [{hmd_pos[0]:.4f}, {hmd_pos[1]:.4f}, {hmd_pos[2]:.4f}]")
 
     result = engine.align(
         depth_raw=depth_array,
@@ -100,20 +212,42 @@ async def capture(
         hmd_rot=hmd_rot,
     )
 
-    engine.fill_holes()
+    filled = engine.fill_holes()
 
+    coverage = result["coverage"]
+    filled_coverage = np.count_nonzero(filled) / (engine.img_w * engine.img_h) * 100
+    print(f"  Coverage: {coverage:.1f}% (after fill: {filled_coverage:.1f}%)")
+
+    # RGB読み込み
+    rgb_bytes_data = None
     if rgb_image is not None:
-        rgb_bytes = await rgb_image.read()
-        session["captures"].append({
-            "rgb_bytes": rgb_bytes,
-            "depth_descriptor": desc.model_dump(),
-            "coverage": result["coverage"],
-        })
+        rgb_bytes_data = await rgb_image.read()
+        if len(rgb_bytes_data) > 0:
+            print(f"  RGB: {len(rgb_bytes_data)} bytes")
+        else:
+            rgb_bytes_data = None
+
+    # 可視化保存
+    save_visualization(
+        session_dir=session["dir"],
+        capture_idx=capture_idx,
+        engine=engine,
+        rgb_bytes=rgb_bytes_data,
+        depth_raw=depth_array,
+        aligned_depth=filled,
+    )
+
+    session["capture_count"] += 1
+    session["captures"].append({
+        "timestamp_ms": desc.timestamp_ms,
+        "coverage": coverage,
+        "filled_coverage": filled_coverage,
+    })
 
     return CaptureResponse(
         aligned=True,
-        coverage=round(result["coverage"], 1),
-        message=f"Coverage: {result['coverage']:.1f}%",
+        coverage=round(coverage, 1),
+        message=f"Coverage: {coverage:.1f}% (filled: {filled_coverage:.1f}%)",
     )
 
 
@@ -153,13 +287,15 @@ async def health():
 async def session_info(session_id: str):
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-    engine: AlignmentEngine = sessions[session_id]["engine"]
+    session = sessions[session_id]
+    engine: AlignmentEngine = session["engine"]
     return {
         "session_id": session_id,
         "initialized": engine._initialized,
         "has_aligned_depth": engine._aligned_depth is not None,
-        "captures_count": len(sessions[session_id]["captures"]),
+        "captures_count": session["capture_count"],
         "image_size": f"{engine.img_w}x{engine.img_h}",
+        "output_dir": str(session["dir"]),
     }
 
 
