@@ -16,11 +16,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
 from core.alignment import AlignmentEngine
+from core.gemini import detect_objects
 from models.schemas import (
     SessionInitRequest, SessionInitResponse,
     DepthDescriptor, HMDPose,
     CaptureResponse, DepthQueryResponse,
-    AnalyzeRequest, AnalyzeResponse,
+    AnalyzeRequest, AnalyzeResponse, DetectedObject,
 )
 
 # 保存先ディレクトリ
@@ -73,29 +74,25 @@ def save_visualization(session_dir: Path, capture_idx: int, engine: AlignmentEng
     # 3. RGB
     if rgb_bytes is not None and len(rgb_bytes) > 0:
         try:
-            # まずPNG/JPGとして開いてみる
             rgb_img = np.array(Image.open(io.BytesIO(rgb_bytes)).convert("RGB"))
         except Exception:
-            # YUV_420_888 (NV21形式) の生データとして処理
             h_guess = 1280
             w_guess = 1280
-            y_size = w_guess * h_guess  # 1638400
+            y_size = w_guess * h_guess
 
             if len(rgb_bytes) >= y_size * 3 // 2:
-                # Y plane + UV interleaved plane
                 yuv_data = np.frombuffer(rgb_bytes[:y_size * 3 // 2], dtype=np.uint8)
-                
-                # OpenCVのcvtColorで変換するため、NV21形式に整形
-                # Y: h*w, UV: h/2 * w (interleaved V,U)
                 nv21 = np.zeros(y_size * 3 // 2, dtype=np.uint8)
                 nv21[:y_size] = yuv_data[:y_size]
                 nv21[y_size:] = yuv_data[y_size:y_size * 3 // 2]
                 nv21 = nv21.reshape((h_guess * 3 // 2, w_guess))
-                
-                # NV21 → BGR
                 rgb_bgr = cv2.cvtColor(nv21, cv2.COLOR_YUV2BGR_NV12)
                 rgb_img = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
-                print(f"  RGB: YUV_420_888 → color ({w_guess}x{h_guess})")
+                print(f"  RGB: YUV_420_888 -> color ({w_guess}x{h_guess})")
+            elif len(rgb_bytes) >= y_size:
+                y_plane = np.frombuffer(rgb_bytes[:y_size], dtype=np.uint8).reshape((h_guess, w_guess))
+                rgb_img = cv2.cvtColor(y_plane, cv2.COLOR_GRAY2RGB)
+                print(f"  RGB: Y plane only -> grayscale ({w_guess}x{h_guess})")
             else:
                 print(f"  RGB: Unknown format, size={len(rgb_bytes)}")
                 return
@@ -104,7 +101,6 @@ def save_visualization(session_dir: Path, capture_idx: int, engine: AlignmentEng
         cv2.imwrite(str(session_dir / f"{prefix}_rgb.png"), rgb_bgr)
         print(f"  Saved: {prefix}_rgb.png ({rgb_img.shape})")
 
-        # 4. Overlay (RGB + Aligned Depth)
         h, w = rgb_img.shape[:2]
         ah, aw = aligned_colored.shape[:2]
         if (h, w) != (ah, aw):
@@ -224,6 +220,8 @@ async def capture(
         rgb_bytes_data = await rgb_image.read()
         if len(rgb_bytes_data) > 0:
             print(f"  RGB: {len(rgb_bytes_data)} bytes")
+            # analyzeエンドポイントで使うために最新RGBを保持
+            session["latest_rgb"] = rgb_bytes_data
         else:
             rgb_bytes_data = None
 
@@ -272,10 +270,113 @@ async def depth_query(session_id: str, u: float, v: float):
 
 @app.post("/session/{session_id}/analyze", response_model=AnalyzeResponse)
 async def analyze(session_id: str, request: AnalyzeRequest):
-    """[Phase 3 stub] LLM + SAMによる画像解析"""
+    """Gemini APIでRGB画像を解析し、検出物体の3D座標を返す"""
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-    return AnalyzeResponse(message="Phase 3: Not yet implemented")
+
+    session = sessions[session_id]
+    engine: AlignmentEngine = session["engine"]
+
+    # 最新のRGB画像を取得
+    rgb_data = session.get("latest_rgb")
+    if rgb_data is None:
+        raise HTTPException(status_code=400, detail="No RGB image captured yet. Capture first.")
+
+    print(f"\n=== Analyze (session {session_id}) ===")
+    print(f"  Task: {request.task}")
+    print(f"  RGB data: {len(rgb_data)} bytes")
+
+    # Gemini APIで検出
+    try:
+        detections = await detect_objects(
+            image_bytes=rgb_data,
+            task=request.task,
+            image_width=engine.img_w,
+            image_height=engine.img_h,
+        )
+    except Exception as e:
+        print(f"  [Analyze] Gemini API error: {e}")
+        raise HTTPException(status_code=500, detail=f"Gemini API error: {e}")
+
+    # 検出結果に3D座標を付与
+    objects = []
+    for det in detections:
+        u, v = det.center[0], det.center[1]
+
+        # Depthから3D座標を取得
+        point_3d = engine.get_3d_point_unity(u, v)
+        depth_m = engine.get_depth_at_pixel(u, v)
+
+        obj = DetectedObject(
+            name=det.name,
+            center_2d=det.center,
+            center_3d=point_3d.tolist() if point_3d is not None else None,
+            depth_m=round(depth_m, 4) if depth_m is not None else None,
+            ar_placement={
+                "bbox": det.bbox,
+                "confidence": det.confidence,
+            },
+        )
+        objects.append(obj)
+
+        print(f"  Object: {det.name}")
+        print(f"    2D center: ({u:.0f}, {v:.0f})")
+        print(f"    Depth: {depth_m:.4f}m" if depth_m else "    Depth: N/A")
+        print(f"    3D: {point_3d}" if point_3d is not None else "    3D: N/A")
+
+    # 可視化: BBoxをRGB画像に描画して保存
+    _save_analyze_visualization(session, detections)
+
+    return AnalyzeResponse(
+        objects=objects,
+        message=f"Detected {len(objects)} objects",
+    )
+
+
+def _save_analyze_visualization(session, detections):
+    """検出結果をRGB画像に描画して保存"""
+    rgb_data = session.get("latest_rgb")
+    if rgb_data is None:
+        return
+
+    session_dir = session["dir"]
+
+    try:
+        # RGB画像を読み込み
+        img_array = cv2.imdecode(
+            np.frombuffer(rgb_data, dtype=np.uint8), cv2.IMREAD_COLOR
+        )
+        if img_array is None:
+            # YUV raw
+            h, w = 1280, 1280
+            y_size = w * h
+            if len(rgb_data) >= y_size:
+                y_plane = np.frombuffer(rgb_data[:y_size], dtype=np.uint8).reshape((h, w))
+                img_array = cv2.cvtColor(y_plane, cv2.COLOR_GRAY2BGR)
+            else:
+                return
+
+        # BBoxを描画
+        for det in detections:
+            x1, y1, x2, y2 = [int(v) for v in det.bbox]
+            cx, cy = int(det.center[0]), int(det.center[1])
+
+            # BBox
+            cv2.rectangle(img_array, (x1, y1), (x2, y2), (0, 255, 0), 3)
+
+            # Center
+            cv2.circle(img_array, (cx, cy), 8, (0, 0, 255), -1)
+
+            # Label
+            cv2.putText(img_array, det.name, (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        output_path = session_dir / "analyze_result.png"
+        cv2.imwrite(str(output_path), img_array)
+        print(f"  Saved: analyze_result.png")
+
+    except Exception as e:
+        print(f"  Failed to save analyze visualization: {e}")
 
 
 @app.get("/health")
