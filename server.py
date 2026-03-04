@@ -17,6 +17,7 @@ from PIL import Image
 
 from core.alignment import AlignmentEngine
 from core.gemini import detect_objects
+from core.sam_segment import segment_with_bbox, mask_contour_to_3d, save_mask_visualization
 from models.schemas import (
     SessionInitRequest, SessionInitResponse,
     DepthDescriptor, HMDPose,
@@ -43,6 +44,36 @@ app.add_middleware(
 )
 
 sessions: dict[str, dict] = {}
+
+
+def decode_rgb(rgb_bytes: bytes, w: int = 1280, h: int = 1280) -> np.ndarray | None:
+    """RGB画像バイト列をデコード。PNG/JPG or YUV_420_888 に対応。戻り値はBGR"""
+    # まずPNG/JPGとしてデコード
+    img = cv2.imdecode(np.frombuffer(rgb_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is not None:
+        return img
+
+    # YUV_420_888 (NV21) として変換
+    y_size = w * h
+    if len(rgb_bytes) >= y_size * 3 // 2:
+        yuv_data = np.frombuffer(rgb_bytes[:y_size * 3 // 2], dtype=np.uint8)
+        nv21 = np.zeros(y_size * 3 // 2, dtype=np.uint8)
+        nv21[:y_size] = yuv_data[:y_size]
+        nv21[y_size:] = yuv_data[y_size:y_size * 3 // 2]
+        nv21 = nv21.reshape((h * 3 // 2, w))
+        bgr = cv2.cvtColor(nv21, cv2.COLOR_YUV2BGR_NV21)
+        print(f"  RGB: YUV_420_888 -> color ({w}x{h})")
+        return bgr
+
+    # Y plane のみ（フォールバック）
+    if len(rgb_bytes) >= y_size:
+        y_plane = np.frombuffer(rgb_bytes[:y_size], dtype=np.uint8).reshape((h, w))
+        bgr = cv2.cvtColor(y_plane, cv2.COLOR_GRAY2BGR)
+        print(f"  RGB: Y plane only -> grayscale ({w}x{h})")
+        return bgr
+
+    print(f"  RGB: Unknown format, size={len(rgb_bytes)}")
+    return None
 
 
 def save_visualization(session_dir: Path, capture_idx: int, engine: AlignmentEngine,
@@ -73,50 +104,28 @@ def save_visualization(session_dir: Path, capture_idx: int, engine: AlignmentEng
 
     # 3. RGB
     if rgb_bytes is not None and len(rgb_bytes) > 0:
-        try:
-            rgb_img = np.array(Image.open(io.BytesIO(rgb_bytes)).convert("RGB"))
-        except Exception:
-            h_guess = 1280
-            w_guess = 1280
-            y_size = w_guess * h_guess
+        rgb_bgr = decode_rgb(rgb_bytes)
+        if rgb_bgr is not None:
+            cv2.imwrite(str(session_dir / f"{prefix}_rgb.png"), rgb_bgr)
+            print(f"  Saved: {prefix}_rgb.png ({rgb_bgr.shape})")
 
-            if len(rgb_bytes) >= y_size * 3 // 2:
-                yuv_data = np.frombuffer(rgb_bytes[:y_size * 3 // 2], dtype=np.uint8)
-                nv21 = np.zeros(y_size * 3 // 2, dtype=np.uint8)
-                nv21[:y_size] = yuv_data[:y_size]
-                nv21[y_size:] = yuv_data[y_size:y_size * 3 // 2]
-                nv21 = nv21.reshape((h_guess * 3 // 2, w_guess))
-                rgb_bgr = cv2.cvtColor(nv21, cv2.COLOR_YUV2BGR_NV12)
-                rgb_img = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2RGB)
-                print(f"  RGB: YUV_420_888 -> color ({w_guess}x{h_guess})")
-            elif len(rgb_bytes) >= y_size:
-                y_plane = np.frombuffer(rgb_bytes[:y_size], dtype=np.uint8).reshape((h_guess, w_guess))
-                rgb_img = cv2.cvtColor(y_plane, cv2.COLOR_GRAY2RGB)
-                print(f"  RGB: Y plane only -> grayscale ({w_guess}x{h_guess})")
+            # 4. Overlay (RGB + Aligned Depth)
+            h, w = rgb_bgr.shape[:2]
+            ah, aw = aligned_colored.shape[:2]
+            if (h, w) != (ah, aw):
+                aligned_resized = cv2.resize(aligned_colored, (w, h), interpolation=cv2.INTER_NEAREST)
+                mask = cv2.resize((aligned_depth > 0).astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
             else:
-                print(f"  RGB: Unknown format, size={len(rgb_bytes)}")
-                return
+                aligned_resized = aligned_colored
+                mask = (aligned_depth > 0).astype(np.uint8)
 
-        rgb_bgr = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(str(session_dir / f"{prefix}_rgb.png"), rgb_bgr)
-        print(f"  Saved: {prefix}_rgb.png ({rgb_img.shape})")
-
-        h, w = rgb_img.shape[:2]
-        ah, aw = aligned_colored.shape[:2]
-        if (h, w) != (ah, aw):
-            aligned_resized = cv2.resize(aligned_colored, (w, h), interpolation=cv2.INTER_NEAREST)
-            mask = cv2.resize((aligned_depth > 0).astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
-        else:
-            aligned_resized = aligned_colored
-            mask = (aligned_depth > 0).astype(np.uint8)
-
-        overlay = rgb_bgr.copy()
-        mask_3ch = np.stack([mask] * 3, axis=-1)
-        overlay = np.where(mask_3ch > 0,
-                           cv2.addWeighted(rgb_bgr, 0.5, aligned_resized, 0.5, 0),
-                           overlay)
-        cv2.imwrite(str(session_dir / f"{prefix}_overlay.png"), overlay)
-        print(f"  Saved: {prefix}_overlay.png")
+            overlay = rgb_bgr.copy()
+            mask_3ch = np.stack([mask] * 3, axis=-1)
+            overlay = np.where(mask_3ch > 0,
+                               cv2.addWeighted(rgb_bgr, 0.5, aligned_resized, 0.5, 0),
+                               overlay)
+            cv2.imwrite(str(session_dir / f"{prefix}_overlay.png"), overlay)
+            print(f"  Saved: {prefix}_overlay.png")
     else:
         print(f"  No RGB image, skipping overlay")
 
@@ -140,6 +149,7 @@ async def session_init(request: SessionInitRequest):
         "captures": [],
         "dir": session_dir,
         "capture_count": 0,
+        "current_task": "drip_tray",
     }
     print(f"\n=== Session {session_id} initialized ===")
     print(f"  Output dir: {session_dir}")
@@ -220,7 +230,6 @@ async def capture(
         rgb_bytes_data = await rgb_image.read()
         if len(rgb_bytes_data) > 0:
             print(f"  RGB: {len(rgb_bytes_data)} bytes")
-            # analyzeエンドポイントで使うために最新RGBを保持
             session["latest_rgb"] = rgb_bytes_data
         else:
             rgb_bytes_data = None
@@ -269,7 +278,7 @@ async def depth_query(session_id: str, u: float, v: float):
 
 
 @app.post("/session/{session_id}/analyze", response_model=AnalyzeResponse)
-async def analyze(session_id: str, request: AnalyzeRequest):
+async def analyze(session_id: str):
     """Gemini APIでRGB画像を解析し、検出物体の3D座標を返す"""
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -282,15 +291,18 @@ async def analyze(session_id: str, request: AnalyzeRequest):
     if rgb_data is None:
         raise HTTPException(status_code=400, detail="No RGB image captured yet. Capture first.")
 
+    # タスクはサーバー側で管理（PDFから自動生成予定）
+    task = session.get("current_task", "drip_tray")
+
     print(f"\n=== Analyze (session {session_id}) ===")
-    print(f"  Task: {request.task}")
+    print(f"  Task: {task}")
     print(f"  RGB data: {len(rgb_data)} bytes")
 
     # Gemini APIで検出
     try:
         detections = await detect_objects(
             image_bytes=rgb_data,
-            task=request.task,
+            task=task,
             image_width=engine.img_w,
             image_height=engine.img_h,
         )
@@ -298,7 +310,11 @@ async def analyze(session_id: str, request: AnalyzeRequest):
         print(f"  [Analyze] Gemini API error: {e}")
         raise HTTPException(status_code=500, detail=f"Gemini API error: {e}")
 
-    # 検出結果に3D座標を付与
+    # RGB画像をデコード (SAM用)
+    session_dir = session["dir"]
+    rgb_bgr = decode_rgb(rgb_data)
+
+    # 検出結果に3D座標を付与 + SAMセグメンテーション
     objects = []
     for det in detections:
         u, v = det.center[0], det.center[1]
@@ -306,6 +322,26 @@ async def analyze(session_id: str, request: AnalyzeRequest):
         # Depthから3D座標を取得
         point_3d = engine.get_3d_point_unity(u, v)
         depth_m = engine.get_depth_at_pixel(u, v)
+
+        # SAMでBBox内をセグメンテーション
+        contour_3d = []
+        if rgb_bgr is not None:
+            try:
+                sam_result = segment_with_bbox(rgb_bgr, det.bbox)
+                contour_3d = mask_contour_to_3d(
+                    sam_result["contours"], engine,
+                    simplify_epsilon=5.0,
+                )
+
+                # マスク可視化を保存
+                save_mask_visualization(
+                    rgb_bgr, sam_result["mask"], sam_result["contours"],
+                    det.bbox,
+                    str(session_dir / f"sam_result_{det.name}.png"),
+                    label=det.name,
+                )
+            except Exception as e:
+                print(f"  [SAM2] Error: {e}")
 
         obj = DetectedObject(
             name=det.name,
@@ -315,6 +351,7 @@ async def analyze(session_id: str, request: AnalyzeRequest):
             ar_placement={
                 "bbox": det.bbox,
                 "confidence": det.confidence,
+                "contour_3d": contour_3d,
             },
         )
         objects.append(obj)
@@ -323,6 +360,7 @@ async def analyze(session_id: str, request: AnalyzeRequest):
         print(f"    2D center: ({u:.0f}, {v:.0f})")
         print(f"    Depth: {depth_m:.4f}m" if depth_m else "    Depth: N/A")
         print(f"    3D: {point_3d}" if point_3d is not None else "    3D: N/A")
+        print(f"    Contour 3D vertices: {len(contour_3d)}")
 
     # 可視化: BBoxをRGB画像に描画して保存
     _save_analyze_visualization(session, detections)
@@ -342,32 +380,17 @@ def _save_analyze_visualization(session, detections):
     session_dir = session["dir"]
 
     try:
-        # RGB画像を読み込み
-        img_array = cv2.imdecode(
-            np.frombuffer(rgb_data, dtype=np.uint8), cv2.IMREAD_COLOR
-        )
+        img_array = decode_rgb(rgb_data)
         if img_array is None:
-            # YUV raw
-            h, w = 1280, 1280
-            y_size = w * h
-            if len(rgb_data) >= y_size:
-                y_plane = np.frombuffer(rgb_data[:y_size], dtype=np.uint8).reshape((h, w))
-                img_array = cv2.cvtColor(y_plane, cv2.COLOR_GRAY2BGR)
-            else:
-                return
+            return
 
         # BBoxを描画
         for det in detections:
             x1, y1, x2, y2 = [int(v) for v in det.bbox]
             cx, cy = int(det.center[0]), int(det.center[1])
 
-            # BBox
             cv2.rectangle(img_array, (x1, y1), (x2, y2), (0, 255, 0), 3)
-
-            # Center
             cv2.circle(img_array, (cx, cy), 8, (0, 0, 255), -1)
-
-            # Label
             cv2.putText(img_array, det.name, (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
@@ -382,6 +405,16 @@ def _save_analyze_visualization(session, detections):
 @app.get("/health")
 async def health():
     return {"status": "ok", "active_sessions": len(sessions)}
+
+
+@app.put("/session/{session_id}/task")
+async def set_task(session_id: str, task: str):
+    """現在の検出タスクを設定（将来的にPDFパイプラインから自動設定）"""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    sessions[session_id]["current_task"] = task
+    print(f"  Task updated: {task}")
+    return {"session_id": session_id, "task": task}
 
 
 @app.get("/session/{session_id}/info")
