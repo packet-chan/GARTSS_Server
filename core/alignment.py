@@ -250,6 +250,62 @@ class AlignmentEngine:
 
         return convert_open3d_to_unity_point(point_world_o3d)
 
+    def get_3d_points_batch(self, u_array, v_array, aligned_depth=None):
+        """
+        複数ピクセルを一括で Unity ワールド座標系の 3D 点に変換。
+        mask_to_point_cloud 用の高速バッチ処理。
+
+        Args:
+            u_array: (N,) float64 ピクセル U 座標
+            v_array: (N,) float64 ピクセル V 座標
+            aligned_depth: (H, W) float32 (省略時は内部保持のもの)
+
+        Returns:
+            points_unity: (M, 3) float64  有効な点の Unity ワールド座標
+            valid_mask: (N,) bool  各入力ピクセルが有効かどうか
+        """
+        if aligned_depth is None:
+            aligned_depth = self._aligned_depth
+        if aligned_depth is None or self._rgb_ext_cw is None:
+            return np.zeros((0, 3)), np.zeros(len(u_array), dtype=bool)
+
+        u_int = np.round(u_array).astype(np.int32)
+        v_int = np.round(v_array).astype(np.int32)
+
+        # 範囲チェック
+        in_bounds = (
+            (u_int >= 0) & (u_int < self.img_w) &
+            (v_int >= 0) & (v_int < self.img_h)
+        )
+
+        # Depth 取得
+        depths = np.zeros(len(u_array), dtype=np.float64)
+        depths[in_bounds] = aligned_depth[v_int[in_bounds], u_int[in_bounds]]
+
+        valid = in_bounds & (depths > 0)
+
+        if np.count_nonzero(valid) == 0:
+            return np.zeros((0, 3)), valid
+
+        u_v = u_array[valid]
+        v_v = v_array[valid]
+        d_v = depths[valid]
+
+        # RGB ピクセル → Open3D カメラ座標系
+        x_cam = (u_v - self.r_cx_o3d) / self.r_fx * d_v
+        y_cam = (v_v - self.r_cy) / self.r_fy * d_v
+        z_cam = d_v
+
+        # カメラ → ワールド (Open3D)
+        pts_cam = np.stack([x_cam, y_cam, z_cam, np.ones_like(z_cam)], axis=1)
+        pts_world_o3d = (self._rgb_ext_cw @ pts_cam.T).T[:, :3]
+
+        # Open3D → Unity (Z 反転)
+        pts_unity = pts_world_o3d.copy()
+        pts_unity[:, 2] *= -1
+
+        return pts_unity, valid
+
     def fill_holes(self, aligned_depth=None, kernel_size=5):
         """スパースなDepthマップの穴埋め"""
         if aligned_depth is None:
