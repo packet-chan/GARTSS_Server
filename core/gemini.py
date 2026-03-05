@@ -1,7 +1,10 @@
 """
 Gemini API を使った画像解析モジュール
-RGB画像を送信し、指定タスクに応じたBounding Boxを取得する
-ピクセル座標で直接返させる方式
+
+改善点 v3:
+- 正規化座標 (0-1000) を採用 → Geminiのネイティブフォーマット
+- 物理クロップ廃止 → 全体画像 + 論理的空間ヒントで2段階検出
+- [ymin, xmin, ymax, xmax] フォーマット (Gemini標準)
 """
 
 import base64
@@ -10,7 +13,9 @@ import os
 import re
 from dataclasses import dataclass
 
+import cv2
 import httpx
+import numpy as np
 
 
 @dataclass
@@ -23,34 +28,42 @@ class BBoxResult:
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
+# タスクごとの親オブジェクトと検出ヒント
+TASK_CONTEXT = {
+    "drip_tray": {
+        "parent": "coffee machine",
+        "description": "the flat removable drip tray at the bottom/base of the coffee machine where liquid drips collect",
+        "hints": "It is a wide, shallow, horizontal platform that sticks out from the front of the machine at the very bottom. Do NOT include the machine body above the tray.",
+    },
+    "water_tank": {
+        "parent": "coffee machine",
+        "description": "the removable water tank/reservoir of the coffee machine",
+        "hints": "Usually located at the back or side of the machine. It is a transparent or semi-transparent container.",
+    },
+    "power_button": {
+        "parent": "coffee machine",
+        "description": "the power button or on/off switch on the coffee machine",
+        "hints": "Usually a circular button or rocker switch on the front or top of the machine.",
+    },
+}
 
-async def detect_objects(
-    image_bytes: bytes,
-    task: str,
-    image_width: int = 1280,
-    image_height: int = 1280,
-    is_grayscale: bool = False,
-) -> list[BBoxResult]:
-    """
-    Gemini API で画像内のオブジェクトを検出する
-    """
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY environment variable is not set")
+DEFAULT_CONTEXT = {
+    "parent": None,
+    "description": "the target component",
+    "hints": "",
+}
 
-    import cv2
-    import numpy as np
 
-    # 画像をbase64エンコード
+def _encode_image(image_bytes: bytes, image_width: int, image_height: int) -> tuple[str, str]:
+    """画像バイト列をbase64エンコード。PNG/JPG/YUV対応。"""
     try:
         img_array = cv2.imdecode(
             np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR
         )
         if img_array is not None:
             _, png_bytes = cv2.imencode(".png", img_array)
-            b64_image = base64.b64encode(png_bytes.tobytes()).decode("utf-8")
-            mime_type = "image/png"
-        else:
-            raise ValueError("Not a valid image format")
+            return base64.b64encode(png_bytes.tobytes()).decode("utf-8"), "image/png"
+        raise ValueError("Not a valid image format")
     except Exception:
         y_size = image_width * image_height
         if len(image_bytes) >= y_size * 3 // 2:
@@ -59,60 +72,41 @@ async def detect_objects(
             nv21[:y_size] = yuv_data[:y_size]
             nv21[y_size:] = yuv_data[y_size:y_size * 3 // 2]
             nv21 = nv21.reshape((image_height * 3 // 2, image_width))
-            rgb_img = cv2.cvtColor(nv21, cv2.COLOR_YUV2BGR_NV21)
+            rgb_img = cv2.cvtColor(nv21, cv2.COLOR_YUV2BGR_NV12)
             _, png_bytes = cv2.imencode(".png", rgb_img)
-            b64_image = base64.b64encode(png_bytes.tobytes()).decode("utf-8")
-            mime_type = "image/png"
             print(f"  [Gemini] Converted YUV to color PNG")
+            return base64.b64encode(png_bytes.tobytes()).decode("utf-8"), "image/png"
         elif len(image_bytes) >= y_size:
             y_plane = np.frombuffer(image_bytes[:y_size], dtype=np.uint8).reshape(
                 (image_height, image_width)
             )
             _, png_bytes = cv2.imencode(".png", y_plane)
-            b64_image = base64.b64encode(png_bytes.tobytes()).decode("utf-8")
-            mime_type = "image/png"
-        else:
-            raise ValueError(f"Cannot process image: size={len(image_bytes)}")
+            return base64.b64encode(png_bytes.tobytes()).decode("utf-8"), "image/png"
+        raise ValueError(f"Cannot process image: size={len(image_bytes)}")
 
-    # プロンプト: ピクセル座標で直接返させる
-    system_prompt = f"""You are an object detection system for AR work assistance.
 
-This image is {image_width}x{image_height} pixels.
+def _normalized_to_pixel(bbox_norm: list[float], image_width: int, image_height: int) -> list[float]:
+    """
+    Gemini正規化座標 [ymin, xmin, ymax, xmax] (0-1000)
+    → ピクセル座標 [x_min, y_min, x_max, y_max] に変換
+    """
+    ymin, xmin, ymax, xmax = bbox_norm
+    x_min = xmin / 1000.0 * image_width
+    y_min = ymin / 1000.0 * image_height
+    x_max = xmax / 1000.0 * image_width
+    y_max = ymax / 1000.0 * image_height
+    return [x_min, y_min, x_max, y_max]
 
-Given the image and a target component name, locate the component and return its bounding box in PIXEL coordinates.
 
-RULES:
-- Coordinates are in PIXELS, not normalized
-- Format: [x_min, y_min, x_max, y_max]
-- x ranges from 0 (left) to {image_width} (right)
-- y ranges from 0 (top) to {image_height} (bottom)
-- x_min < x_max and y_min < y_max
-- The box must tightly enclose the ENTIRE target object with ~3% margin
-- Look carefully at the image and identify the exact object boundaries
-
-Respond ONLY with JSON, no markdown, no explanation:
-{{"name": "component_name", "bbox": [x_min, y_min, x_max, y_max]}}
-
-If not found:
-{{"name": "not_found", "bbox": [0, 0, 0, 0]}}"""
-
-    user_prompt = (
-        f"I want to identify where the {task} is in this {image_width}x{image_height} pixel image.\n"
-        f"The drip_tray is the flat removable tray at the very bottom/base of the coffee machine where drips collect. "
-        f"It is a wide, shallow, horizontal platform that sticks out from the front of the machine. "
-        f"Do NOT include the machine body above the tray.\n"
-        f"The bounding box must enclose the ENTIRE tray from its left edge to right edge, top surface to bottom. "
-        f"Make the box slightly larger than the tray (5% margin).\n"
-        f"Output the bounding box in pixel coordinates [x_min, y_min, x_max, y_max]."
-    )
-
+async def _call_gemini(prompt: str, b64_image: str, mime_type: str) -> dict | None:
+    """Gemini API を呼び出して JSON レスポンスを返す"""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 
     payload = {
         "contents": [
             {
                 "parts": [
-                    {"text": system_prompt + "\n\n" + user_prompt},
+                    {"text": prompt},
                     {
                         "inline_data": {
                             "mime_type": mime_type,
@@ -138,71 +132,163 @@ If not found:
         text = result["candidates"][0]["content"]["parts"][0]["text"]
     except (KeyError, IndexError) as e:
         print(f"  [Gemini] Unexpected response structure: {e}")
-        print(f"  [Gemini] Response: {json.dumps(result, indent=2)[:500]}")
-        return []
+        return None
 
     print(f"  [Gemini] Raw response: {text[:500]}")
 
-    # JSONを抽出
     text = text.strip()
     json_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
     if json_match:
         text = json_match.group(1)
 
     try:
-        data = json.loads(text)
+        return json.loads(text)
     except json.JSONDecodeError as e:
         print(f"  [Gemini] Failed to parse JSON: {e}")
-        print(f"  [Gemini] Raw text: {text[:300]}")
-        return []
+        return None
 
-    # BBoxResult に変換（ピクセル座標をそのまま使用）
-    results = []
 
-    if "bbox" in data:
-        objects_list = [data]
-    elif "targets" in data:
-        objects_list = data["targets"]
-    elif "objects" in data:
-        objects_list = data["objects"]
-    else:
-        objects_list = [data]
+def _parse_normalized_bbox(data: dict) -> list[float] | None:
+    """JSON レスポンスから正規化 BBox [ymin, xmin, ymax, xmax] を抽出"""
+    bbox = data.get("bbox")
+    if bbox is None or len(bbox) != 4:
+        return None
 
-    for obj in objects_list:
-        bbox = obj.get("bbox")
-        name = obj.get("name") or obj.get("label") or "unknown"
+    ymin, xmin, ymax, xmax = [float(v) for v in bbox]
 
-        if bbox is None or name == "not_found":
-            continue
-        if len(bbox) != 4:
-            continue
+    # 範囲チェック (0-1000)
+    ymin = max(0, min(ymin, 1000))
+    xmin = max(0, min(xmin, 1000))
+    ymax = max(0, min(ymax, 1000))
+    xmax = max(0, min(xmax, 1000))
 
-        x_min, y_min, x_max, y_max = bbox
+    if xmin >= xmax or ymin >= ymax:
+        print(f"  [Gemini] Invalid bbox: [{ymin},{xmin},{ymax},{xmax}]")
+        return None
 
-        # クリップ
-        x_min = max(0, min(x_min, image_width))
-        y_min = max(0, min(y_min, image_height))
-        x_max = max(0, min(x_max, image_width))
-        y_max = max(0, min(y_max, image_height))
+    return [ymin, xmin, ymax, xmax]
 
-        if x_min >= x_max or y_min >= y_max:
-            print(f"  [Gemini] Invalid bbox: x=[{x_min},{x_max}], y=[{y_min},{y_max}]")
-            continue
 
-        cx = (x_min + x_max) / 2
-        cy = (y_min + y_max) / 2
+async def detect_objects(
+    image_bytes: bytes,
+    task: str,
+    image_width: int = 1280,
+    image_height: int = 1280,
+    is_grayscale: bool = False,
+) -> list[BBoxResult]:
+    """
+    Gemini API で画像内のオブジェクトを検出する。
 
-        results.append(
-            BBoxResult(
-                name=name,
-                bbox=[x_min, y_min, x_max, y_max],
-                center=[cx, cy],
-                confidence="high",
-            )
+    2段階検出（物理クロップなし）:
+      Stage 1: 親オブジェクトの位置を正規化座標で取得
+      Stage 2: 全体画像 + 親の位置情報をヒントにターゲットを検出
+
+    正規化座標 [ymin, xmin, ymax, xmax] (0-1000) を使用。
+    """
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY environment variable is not set")
+
+    b64_image, mime_type = _encode_image(image_bytes, image_width, image_height)
+
+    context = TASK_CONTEXT.get(task, DEFAULT_CONTEXT)
+    parent_name = context.get("parent")
+
+    # =========================================================
+    #  Stage 1: 親オブジェクトの検出（正規化座標）
+    # =========================================================
+    parent_bbox_norm = None
+    if parent_name:
+        stage1_prompt = f"""You are a precise object detection system.
+
+Locate the {parent_name} in this image.
+Return the bounding box in NORMALIZED coordinates scaled from 0 to 1000.
+
+Use the format [ymin, xmin, ymax, xmax] where:
+- ymin: top edge (0 = top of image, 1000 = bottom)
+- xmin: left edge (0 = left of image, 1000 = right)
+- ymax: bottom edge
+- xmax: right edge
+
+The box must enclose the ENTIRE {parent_name} including ALL of its parts (body, base, tray, buttons, everything).
+
+Respond ONLY with JSON:
+{{"name": "{parent_name}", "bbox": [ymin, xmin, ymax, xmax]}}"""
+
+        print(f"  [Gemini] Stage 1: Detecting parent '{parent_name}'...")
+        data = await _call_gemini(stage1_prompt, b64_image, mime_type)
+        if data:
+            parent_bbox_norm = _parse_normalized_bbox(data)
+            if parent_bbox_norm:
+                print(f"  [Gemini] Stage 1: Parent norm bbox = {parent_bbox_norm}")
+
+    # =========================================================
+    #  Stage 2: ターゲット検出（全体画像 + 空間ヒント）
+    # =========================================================
+    description = context.get("description", task)
+    hints = context.get("hints", "")
+
+    # 親の位置情報を論理ヒントとして構築
+    spatial_hint = ""
+    if parent_bbox_norm:
+        ymin_p, xmin_p, ymax_p, xmax_p = parent_bbox_norm
+        spatial_hint = (
+            f"\nSPATIAL CONTEXT: The {parent_name} is located at normalized coordinates "
+            f"[ymin={ymin_p:.0f}, xmin={xmin_p:.0f}, ymax={ymax_p:.0f}, xmax={xmax_p:.0f}] in this image. "
+            f"Use this location as reference to find the {task}, which is part of the {parent_name}."
         )
 
-    print(f"  [Gemini] Detected {len(results)} objects")
-    for r in results:
-        print(f"    - {r.name}: bbox=[{r.bbox[0]:.0f},{r.bbox[1]:.0f},{r.bbox[2]:.0f},{r.bbox[3]:.0f}], center=({r.center[0]:.0f},{r.center[1]:.0f})")
+    stage2_prompt = f"""You are a precise object detection system for AR work assistance.
 
-    return results
+Find the {task} in this image.
+Description: {description}
+{f'Hints: {hints}' if hints else ''}{spatial_hint}
+
+Return the bounding box in NORMALIZED coordinates scaled from 0 to 1000.
+
+Use the format [ymin, xmin, ymax, xmax] where:
+- ymin: top edge (0 = top of image, 1000 = bottom)
+- xmin: left edge (0 = left of image, 1000 = right)
+- ymax: bottom edge
+- xmax: right edge
+
+The box must TIGHTLY enclose the ENTIRE {task} with a small margin (~3%).
+Be very precise about the boundaries.
+
+Respond ONLY with JSON:
+{{"name": "{task}", "bbox": [ymin, xmin, ymax, xmax]}}
+
+If not found:
+{{"name": "not_found", "bbox": [0, 0, 0, 0]}}"""
+
+    stage_label = "Stage 2" if parent_bbox_norm else "Single-stage"
+    print(f"  [Gemini] {stage_label}: Detecting '{task}'...")
+    data = await _call_gemini(stage2_prompt, b64_image, mime_type)
+
+    if data is None:
+        print(f"  [Gemini] Detection failed for '{task}'")
+        return []
+
+    target_bbox_norm = _parse_normalized_bbox(data)
+    if target_bbox_norm is None:
+        name = data.get("name", "")
+        if name == "not_found":
+            print(f"  [Gemini] Target '{task}' not found")
+        return []
+
+    # 正規化座標 → ピクセル座標に変換
+    pixel_bbox = _normalized_to_pixel(target_bbox_norm, image_width, image_height)
+
+    cx = (pixel_bbox[0] + pixel_bbox[2]) / 2
+    cy = (pixel_bbox[1] + pixel_bbox[3]) / 2
+
+    confidence = "high" if parent_bbox_norm else "medium"
+
+    print(f"  [Gemini] {stage_label}: norm bbox = {target_bbox_norm}")
+    print(f"  [Gemini] Final: pixel bbox = [{pixel_bbox[0]:.0f},{pixel_bbox[1]:.0f},{pixel_bbox[2]:.0f},{pixel_bbox[3]:.0f}], center=({cx:.0f},{cy:.0f})")
+
+    return [BBoxResult(
+        name=task,
+        bbox=pixel_bbox,
+        center=[cx, cy],
+        confidence=confidence,
+    )]
