@@ -53,6 +53,7 @@ def get_predictor():
 def segment_with_bbox(
     image_bgr: np.ndarray,
     bbox: list[float],
+    margin_ratio: float = 0.1,
 ) -> dict:
     """
     BBoxプロンプトでSAM2セグメンテーションを実行
@@ -60,6 +61,7 @@ def segment_with_bbox(
     Args:
         image_bgr: BGR画像 (OpenCV形式)
         bbox: [x_min, y_min, x_max, y_max] ピクセル座標
+        margin_ratio: BBoxを各方向に何%広げるか (0.1 = 10%)
 
     Returns:
         {
@@ -76,8 +78,23 @@ def segment_with_bbox(
     # 画像をセット
     predictor.set_image(image_rgb)
 
+    # BBox にマージンを追加してSAMに渡す
+    h, w = image_bgr.shape[:2]
+    x_min, y_min, x_max, y_max = bbox
+    bw = x_max - x_min
+    bh = y_max - y_min
+    mx = bw * margin_ratio
+    my = bh * margin_ratio
+    expanded_bbox = [
+        max(0, x_min - mx),
+        max(0, y_min - my),
+        min(w, x_max + mx),
+        min(h, y_max + my),
+    ]
+    print(f"  [SAM2] BBox: [{x_min:.0f},{y_min:.0f},{x_max:.0f},{y_max:.0f}] → expanded: [{expanded_bbox[0]:.0f},{expanded_bbox[1]:.0f},{expanded_bbox[2]:.0f},{expanded_bbox[3]:.0f}] (margin={margin_ratio*100:.0f}%)")
+
     # BBoxプロンプト
-    input_box = np.array(bbox)  # [x_min, y_min, x_max, y_max]
+    input_box = np.array(expanded_bbox)  # [x_min, y_min, x_max, y_max]
 
     # 推論
     masks, scores, _ = predictor.predict(

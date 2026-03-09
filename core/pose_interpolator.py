@@ -80,5 +80,11 @@ class PoseInterpolator:
 
         return pos, rot
 
+    def get_latest_pose(self) -> Optional[tuple]:
+        """最新のHMDポーズを返す"""
+        if len(self.timestamps) == 0:
+            return None
+        return self.positions[-1].copy(), self.rotations[-1].copy()
+
     def __len__(self) -> int:
         return len(self.timestamps)

@@ -18,11 +18,14 @@ from PIL import Image
 from core.alignment import AlignmentEngine
 from core.gemini import detect_objects
 from core.sam_segment import segment_with_bbox, mask_contour_to_3d, save_mask_visualization, mask_to_point_cloud, save_ply
+from core.normal_estimator import compute_surface_normal, compute_action_direction, compute_arrow_start
+from core.action_mapping import get_action_config
+from core.depth_path import compute_pull_guide_path, project_3d_direction_to_2d
 from models.schemas import (
     SessionInitRequest, SessionInitResponse,
     DepthDescriptor, HMDPose,
     CaptureResponse, DepthQueryResponse,
-    AnalyzeRequest, AnalyzeResponse, DetectedObject,
+    AnalyzeRequest, AnalyzeResponse, DetectedObject, SurfaceInfo,
 )
 
 # 保存先ディレクトリ
@@ -325,6 +328,7 @@ async def analyze(session_id: str):
 
         # SAMでBBox内をセグメンテーション
         contour_3d = []
+        pc_result = {"count": 0, "points": np.zeros((0, 3)), "colors": None}
         if rgb_bgr is not None:
             try:
                 sam_result = segment_with_bbox(rgb_bgr, det.bbox)
@@ -360,6 +364,87 @@ async def analyze(session_id: str):
             except Exception as e:
                 print(f"  [SAM2] Error: {e}")
 
+        # === Surface Normal 推定 & 操作方向計算 ===
+        surface_info = None
+        if pc_result["count"] > 0:
+            try:
+                # HMD 位置をカメラ位置の近似として使用
+                camera_pos = None
+                latest_pose = engine.interpolator.get_latest_pose()
+                if latest_pose is not None:
+                    camera_pos = np.array(latest_pose[0])
+
+                # PCA で法線推定
+                normal_result = compute_surface_normal(
+                    points=pc_result["points"],
+                    camera_position=camera_pos,
+                )
+
+                if normal_result["valid"]:
+                    # タスクに応じた操作方向を取得
+                    action_config = get_action_config(task)
+                    action_dir = compute_action_direction(
+                        normal=normal_result["normal"],
+                        action_type=action_config["action_type"],
+                        camera_position=camera_pos,
+                        centroid=normal_result["centroid"],
+                    )
+
+                    # Depth 沿いのガイドパス生成
+                    guide_path = None
+                    if action_config["action_type"] == "pull":
+                        # 3D 操作方向を 2D に射影
+                        dir_2d = project_3d_direction_to_2d(
+                            engine=engine,
+                            centroid_2d=(u, v),
+                            direction_3d=action_dir,
+                        )
+                        if dir_2d is not None:
+                            guide_path = compute_pull_guide_path(
+                                engine=engine,
+                                centroid_2d=(u, v),
+                                action_direction_2d=dir_2d,
+                                arrow_length_m=action_config["arrow_length_m"],
+                            )
+                            print(f"    Guide path: {len(guide_path)} points")
+
+                    # guide_path をフラット化 [x0,y0,z0, x1,y1,z1, ...]
+                    guide_path_flat = None
+                    if guide_path and len(guide_path) > 0:
+                        guide_path_flat = []
+                        for pt in guide_path:
+                            guide_path_flat.extend(pt)
+
+                    # 矢印の開始位置を計算 (前端 + 法線オフセット)
+                    arrow_start = compute_arrow_start(
+                        points=pc_result["points"],
+                        centroid=normal_result["centroid"],
+                        action_direction=action_dir,
+                        normal=normal_result["normal"],
+                        offset_m=0.03,
+                    )
+
+                    surface_info = SurfaceInfo(
+                        centroid_3d=normal_result["centroid"].tolist(),
+                        normal=normal_result["normal"].tolist(),
+                        action_direction=action_dir.tolist(),
+                        action_type=action_config["action_type"],
+                        ar_content_type=action_config["ar_content"],
+                        label=action_config.get("label_en", ""),
+                        guide_path_flat=guide_path_flat,
+                        planarity=round(normal_result["planarity"], 4),
+                        arrow_start_3d=arrow_start.tolist(),
+                    )
+
+                    print(f"    Normal: [{normal_result['normal'][0]:.4f}, {normal_result['normal'][1]:.4f}, {normal_result['normal'][2]:.4f}]")
+                    print(f"    Action: {action_config['action_type']} → [{action_dir[0]:.4f}, {action_dir[1]:.4f}, {action_dir[2]:.4f}]")
+                    print(f"    Arrow start: [{arrow_start[0]:.4f}, {arrow_start[1]:.4f}, {arrow_start[2]:.4f}]")
+                    print(f"    Planarity: {normal_result['planarity']:.4f}")
+                else:
+                    print(f"    [Normal] Estimation not reliable (planarity={normal_result['planarity']:.4f})")
+            except Exception as e:
+                print(f"    [Normal] Error: {e}")
+
         obj = DetectedObject(
             name=det.name,
             center_2d=det.center,
@@ -370,6 +455,7 @@ async def analyze(session_id: str):
                 "confidence": det.confidence,
                 "contour_3d": contour_3d,
             },
+            surface_info=surface_info,
         )
         objects.append(obj)
 

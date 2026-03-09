@@ -35,6 +35,11 @@ TASK_CONTEXT = {
         "description": "the flat removable drip tray at the bottom/base of the coffee machine where liquid drips collect",
         "hints": "It is a wide, shallow, horizontal platform that sticks out from the front of the machine at the very bottom. Do NOT include the machine body above the tray.",
     },
+    "rotary_knob": {
+        "parent": "coffee machine",
+        "description": "the LEFT rotary dial/knob on the front panel of the coffee machine",
+        "hints": "This machine (Jura Impressa) has TWO silver/chrome circular dials on the front. Target ONLY the LEFT dial (the one on the left side when facing the machine). It is round, metallic/silver, and can be turned. The bounding box should TIGHTLY enclose just this one circular knob, NOT both knobs.",
+    },
     "water_tank": {
         "parent": "coffee machine",
         "description": "the removable water tank/reservoir of the coffee machine",
