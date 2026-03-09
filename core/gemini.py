@@ -104,8 +104,13 @@ def _normalized_to_pixel(bbox_norm: list[float], image_width: int, image_height:
 
 
 async def _call_gemini(prompt: str, b64_image: str, mime_type: str) -> dict | None:
-    """Gemini API を呼び出して JSON レスポンスを返す"""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    """Gemini API を呼び出して JSON レスポンスを返す。429 なら Lite にフォールバック。"""
+
+    models = [
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-3.1-flash-lite",
+    ]
 
     payload = {
         "contents": [
@@ -127,30 +132,46 @@ async def _call_gemini(prompt: str, b64_image: str, mime_type: str) -> dict | No
         },
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(url, json=payload)
-        response.raise_for_status()
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, json=payload)
+                if response.status_code == 429:
+                    print(f"  [Gemini] {model} → 429 Rate Limited, trying next model...")
+                    continue
+                response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429:
+                print(f"  [Gemini] {model} → 429 Rate Limited, trying next model...")
+                continue
+            raise
 
-    result = response.json()
+        print(f"  [Gemini] Using model: {model}")
+        result = response.json()
 
-    try:
-        text = result["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError) as e:
-        print(f"  [Gemini] Unexpected response structure: {e}")
-        return None
+        try:
+            text = result["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError) as e:
+            print(f"  [Gemini] Unexpected response structure: {e}")
+            return None
 
-    print(f"  [Gemini] Raw response: {text[:500]}")
+        print(f"  [Gemini] Raw response: {text[:500]}")
 
-    text = text.strip()
-    json_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-    if json_match:
-        text = json_match.group(1)
+        text = text.strip()
+        json_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+        if json_match:
+            text = json_match.group(1)
 
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        print(f"  [Gemini] Failed to parse JSON: {e}")
-        return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            print(f"  [Gemini] Failed to parse JSON: {e}")
+            return None
+
+    # 全モデルが 429 だった場合
+    print(f"  [Gemini] All models rate limited!")
+    return None
 
 
 def _parse_normalized_bbox(data: dict) -> list[float] | None:

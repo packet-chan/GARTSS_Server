@@ -111,16 +111,14 @@ def compute_action_direction(
         centroid = np.zeros(3)
 
     if action_type == "pull":
-        # 引き出す = カメラ方向をサーフェス面に射影
+        # 引き出す = カメラ方向を水平面に射影
+        # トレーやタンクは水平に引き出すものなので、Y成分を0にして水平に限定
         to_camera = camera_position - centroid
-        to_camera_norm = to_camera / max(np.linalg.norm(to_camera), 1e-8)
-        # 面への射影: v - (v·n)n
-        projected = to_camera_norm - np.dot(to_camera_norm, normal) * normal
-        norm = np.linalg.norm(projected)
+        to_camera[1] = 0  # Y成分を除去 → 水平方向のみ
+        norm = np.linalg.norm(to_camera)
         if norm < 1e-6:
-            # カメラが真上にある → 手前方向を Z+ と仮定
             return np.array([0.0, 0.0, 1.0])
-        return projected / norm
+        return to_camera / norm
 
     elif action_type == "push" or action_type == "press":
         # 押す = Normal の逆方向（面に向かって押し込む）

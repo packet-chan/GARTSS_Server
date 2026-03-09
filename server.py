@@ -21,6 +21,7 @@ from core.sam_segment import segment_with_bbox, mask_contour_to_3d, save_mask_vi
 from core.normal_estimator import compute_surface_normal, compute_action_direction, compute_arrow_start
 from core.action_mapping import get_action_config
 from core.depth_path import compute_pull_guide_path, project_3d_direction_to_2d
+from core.mesh_generator import pointcloud_to_mesh
 from models.schemas import (
     SessionInitRequest, SessionInitResponse,
     DepthDescriptor, HMDPose,
@@ -233,7 +234,15 @@ async def capture(
         rgb_bytes_data = await rgb_image.read()
         if len(rgb_bytes_data) > 0:
             print(f"  RGB: {len(rgb_bytes_data)} bytes")
-            session["latest_rgb"] = rgb_bytes_data
+            # YUV_420_888 の正しいサイズ: w * h * 1.5 = 1280*1280*1.5 = 2457600
+            # 実際は padding で 3276798 バイト程度
+            # 壊れたフレームは保存しない
+            expected_min = engine.img_w * engine.img_h  # 最低でもY planeサイズ以上
+            if len(rgb_bytes_data) >= expected_min:
+                session["latest_rgb"] = rgb_bytes_data
+            else:
+                print(f"  RGB: Skipping corrupt frame ({len(rgb_bytes_data)} < {expected_min})")
+                rgb_bytes_data = None
         else:
             rgb_bytes_data = None
 
@@ -360,6 +369,14 @@ async def analyze(session_id: str):
                         colors=pc_result["colors"],
                     )
                     print(f"    Point cloud: {pc_result['count']} points → {ply_path}")
+
+                    # メッシュ生成用に点群をセッションに保存
+                    if "point_clouds" not in session:
+                        session["point_clouds"] = {}
+                    session["point_clouds"][det.name] = {
+                        "points": pc_result["points"],
+                        "colors": pc_result["colors"],
+                    }
 
             except Exception as e:
                 print(f"  [SAM2] Error: {e}")
@@ -508,6 +525,44 @@ def _save_analyze_visualization(session, detections):
 @app.get("/health")
 async def health():
     return {"status": "ok", "active_sessions": len(sessions)}
+
+
+@app.get("/session/{session_id}/mesh/{object_name}")
+async def get_mesh(session_id: str, object_name: str, target_triangles: int = 5000):
+    """
+    検出オブジェクトの色付き3Dメッシュを生成して返す。
+    analyze 実行後に呼び出す。
+
+    Returns:
+        {
+            "vertex_count": int,
+            "triangle_count": int,
+            "vertices": [x0,y0,z0, ...],
+            "triangles": [i0,i1,i2, ...],
+            "normals": [nx0,ny0,nz0, ...],
+            "colors": [r0,g0,b0, ...],   (0-1)
+        }
+    """
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = sessions[session_id]
+    pc_data = session.get("point_clouds", {}).get(object_name)
+    if pc_data is None:
+        raise HTTPException(status_code=404, detail=f"No point cloud for '{object_name}'. Run analyze first.")
+
+    print(f"\n=== Mesh generation: {object_name} (session {session_id}) ===")
+
+    mesh_data = pointcloud_to_mesh(
+        points=pc_data["points"],
+        colors=pc_data["colors"],
+        target_triangles=target_triangles,
+    )
+
+    if mesh_data is None:
+        raise HTTPException(status_code=500, detail="Mesh generation failed")
+
+    return mesh_data
 
 
 @app.put("/session/{session_id}/task")
