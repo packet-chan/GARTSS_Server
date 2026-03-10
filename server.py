@@ -371,11 +371,14 @@ async def analyze(session_id: str):
                     print(f"    Point cloud: {pc_result['count']} points → {ply_path}")
 
                     # メッシュ生成用に点群をセッションに保存
+                    # reference_3d: get_3d_point_unity (メディアンDepth) で求めた正確な3D位置
+                    # 点群の centroid とのオフセットを補正に使う
                     if "point_clouds" not in session:
                         session["point_clouds"] = {}
                     session["point_clouds"][det.name] = {
                         "points": pc_result["points"],
                         "colors": pc_result["colors"],
+                        "reference_3d": point_3d.tolist() if point_3d is not None else None,
                     }
 
             except Exception as e:
@@ -527,6 +530,74 @@ async def health():
     return {"status": "ok", "active_sessions": len(sessions)}
 
 
+@app.get("/session/{session_id}/pointcloud/{object_name}")
+async def get_pointcloud(session_id: str, object_name: str, max_points: int = 10000):
+    """
+    検出オブジェクトの点群データを返す。
+    get_3d_point_unity (メディアンDepth) と点群 centroid のオフセットで補正済み。
+
+    補正ロジック:
+      矢印位置 (get_3d_point_unity) は正確 → これを基準とする
+      点群 centroid との差分 = Depth参照方法の差によるずれ
+      点群全体をこの差分だけシフト → 矢印と同じ位置に揃う
+      このロジックはタスク・対象物に依存しない汎用補正。
+
+    Returns:
+        {
+            "count": int,
+            "vertices": [x0,y0,z0, ...],
+            "colors": [r0,g0,b0, ...],
+        }
+    """
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = sessions[session_id]
+    pc_data = session.get("point_clouds", {}).get(object_name)
+    if pc_data is None:
+        raise HTTPException(status_code=404, detail=f"No point cloud for '{object_name}'. Run analyze first.")
+
+    points = pc_data["points"].copy()
+    colors = pc_data["colors"].copy() if pc_data["colors"] is not None else None
+    reference_3d = pc_data.get("reference_3d")
+    n_original = len(points)
+
+    # オフセット補正:
+    # reference_3d (get_3d_point_unity, メディアンDepth) は正確な位置
+    # 点群 centroid (get_3d_points_batch, 個別Depth) はずれている
+    # → 差分で点群全体をシフト
+    if reference_3d is not None and len(points) > 0:
+        centroid = points.mean(axis=0)
+        ref = np.array(reference_3d)
+        offset = ref - centroid
+        points = points + offset
+        print(f"[PointCloud API] Offset correction: [{offset[0]:.4f}, {offset[1]:.4f}, {offset[2]:.4f}]")
+
+    # ダウンサンプリング
+    n = len(points)
+    if n > max_points:
+        step = n // max_points
+        points = points[::step]
+        if colors is not None:
+            colors = colors[::step]
+
+    # 色を 0-1 に正規化
+    colors_normalized = None
+    if colors is not None:
+        colors_f = colors.astype(float)
+        if colors_f.max() > 1.0:
+            colors_f = colors_f / 255.0
+        colors_normalized = colors_f.flatten().tolist()
+
+    print(f"[PointCloud API] {object_name}: {len(points)} points (from {n_original})")
+
+    return {
+        "count": len(points),
+        "vertices": points.flatten().tolist(),
+        "colors": colors_normalized,
+    }
+
+
 @app.get("/session/{session_id}/mesh/{object_name}")
 async def get_mesh(session_id: str, object_name: str, target_triangles: int = 5000):
     """
@@ -561,6 +632,17 @@ async def get_mesh(session_id: str, object_name: str, target_triangles: int = 50
 
     if mesh_data is None:
         raise HTTPException(status_code=500, detail="Mesh generation failed")
+
+    # オフセット補正 (pointcloud エンドポイントと同じロジック)
+    reference_3d = pc_data.get("reference_3d")
+    if reference_3d is not None and mesh_data["vertex_count"] > 0:
+        verts = np.array(mesh_data["vertices"]).reshape(-1, 3)
+        centroid = verts.mean(axis=0)
+        ref = np.array(reference_3d)
+        offset = ref - centroid
+        verts = verts + offset
+        mesh_data["vertices"] = verts.flatten().tolist()
+        print(f"  [Mesh] Offset correction: [{offset[0]:.4f}, {offset[1]:.4f}, {offset[2]:.4f}]")
 
     return mesh_data
 
