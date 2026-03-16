@@ -5,6 +5,10 @@ Gemini API を使った画像解析モジュール
 - 正規化座標 (0-1000) を採用 → Geminiのネイティブフォーマット
 - 物理クロップ廃止 → 全体画像 + 論理的空間ヒントで2段階検出
 - [ymin, xmin, ymax, xmax] フォーマット (Gemini標準)
+
+改善点 v4:
+- arrow_origin (矢印起点の2Dピクセル座標) をGeminiに返させる
+- TASK_CONTEXT に arrow_origin_hint を追加
 """
 
 import base64
@@ -24,31 +28,38 @@ class BBoxResult:
     bbox: list[float]  # [x_min, y_min, x_max, y_max] in pixel coordinates
     center: list[float]  # [cx, cy] in pixel coordinates
     confidence: str  # "high", "medium", "low"
+    arrow_origin: list[float] | None = None  # [x, y] 矢印起点のピクセル座標 (Gemini指定)
 
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # タスクごとの親オブジェクトと検出ヒント
+# Gemini の視覚認識能力に任せる方針: hints は最小限に。
+# 過剰な指示はモデルの判断を歪めるリスクがある。
 TASK_CONTEXT = {
     "drip_tray": {
         "parent": "coffee machine",
-        "description": "the flat removable drip tray at the bottom/base of the coffee machine where liquid drips collect",
-        "hints": "It is a wide, shallow, horizontal platform that sticks out from the front of the machine at the very bottom. Do NOT include the machine body above the tray.",
+        "description": "the drip tray",
+        "hints": "",
+        "arrow_origin_hint": "the center of the FRONT FACE (vertical surface) of the drip tray, NOT the top surface",
     },
     "rotary_knob": {
         "parent": "coffee machine",
-        "description": "the LEFT rotary dial/knob on the front panel of the coffee machine",
-        "hints": "This machine (Jura Impressa) has TWO silver/chrome circular dials on the front. Target ONLY the LEFT dial (the one on the left side when facing the machine). It is round, metallic/silver, and can be turned. The bounding box should TIGHTLY enclose just this one circular knob, NOT both knobs.",
+        "description": "the left rotary knob",
+        "hints": "Target only the LEFT knob.",
+        "arrow_origin_hint": "the center of the knob surface",
     },
     "water_tank": {
         "parent": "coffee machine",
-        "description": "the removable water tank/reservoir of the coffee machine",
-        "hints": "Usually located at the back or side of the machine. It is a transparent or semi-transparent container.",
+        "description": "the water tank",
+        "hints": "",
+        "arrow_origin_hint": "the top center of the water tank",
     },
     "power_button": {
         "parent": "coffee machine",
-        "description": "the power button or on/off switch on the coffee machine",
-        "hints": "Usually a circular button or rocker switch on the front or top of the machine.",
+        "description": "the power button",
+        "hints": "",
+        "arrow_origin_hint": "the center of the button surface",
     },
 }
 
@@ -56,6 +67,7 @@ DEFAULT_CONTEXT = {
     "parent": None,
     "description": "the target component",
     "hints": "",
+    "arrow_origin_hint": "",
 }
 
 
@@ -128,7 +140,7 @@ async def _call_gemini(prompt: str, b64_image: str, mime_type: str) -> dict | No
         ],
         "generationConfig": {
             "temperature": 0.1,
-            "maxOutputTokens": 1024,
+            "maxOutputTokens": 2048,
         },
     }
 
@@ -210,6 +222,8 @@ async def detect_objects(
       Stage 2: 全体画像 + 親の位置情報をヒントにターゲットを検出
 
     正規化座標 [ymin, xmin, ymax, xmax] (0-1000) を使用。
+
+    v4: arrow_origin (矢印起点) も同時に返す。
     """
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY environment variable is not set")
@@ -224,20 +238,11 @@ async def detect_objects(
     # =========================================================
     parent_bbox_norm = None
     if parent_name:
-        stage1_prompt = f"""You are a precise object detection system.
+        stage1_prompt = f"""Locate the {parent_name} in this image.
+Return bounding box in normalized coordinates (0-1000), format [ymin, xmin, ymax, xmax].
+Enclose the ENTIRE {parent_name} including all parts.
 
-Locate the {parent_name} in this image.
-Return the bounding box in NORMALIZED coordinates scaled from 0 to 1000.
-
-Use the format [ymin, xmin, ymax, xmax] where:
-- ymin: top edge (0 = top of image, 1000 = bottom)
-- xmin: left edge (0 = left of image, 1000 = right)
-- ymax: bottom edge
-- xmax: right edge
-
-The box must enclose the ENTIRE {parent_name} including ALL of its parts (body, base, tray, buttons, everything).
-
-Respond ONLY with JSON:
+Respond with single-line compact JSON only:
 {{"name": "{parent_name}", "bbox": [ymin, xmin, ymax, xmax]}}"""
 
         print(f"  [Gemini] Stage 1: Detecting parent '{parent_name}'...")
@@ -252,6 +257,7 @@ Respond ONLY with JSON:
     # =========================================================
     description = context.get("description", task)
     hints = context.get("hints", "")
+    arrow_origin_hint = context.get("arrow_origin_hint", "")
 
     # 親の位置情報を論理ヒントとして構築
     spatial_hint = ""
@@ -263,28 +269,19 @@ Respond ONLY with JSON:
             f"Use this location as reference to find the {task}, which is part of the {parent_name}."
         )
 
-    stage2_prompt = f"""You are a precise object detection system for AR work assistance.
+    stage2_prompt = f"""Find {description} of the {parent_name if parent_name else 'device'} in this image.
+{f'{hints}' if hints else ''}{spatial_hint}
 
-Find the {task} in this image.
-Description: {description}
-{f'Hints: {hints}' if hints else ''}{spatial_hint}
+Return bounding box in normalized coordinates (0-1000), format [ymin, xmin, ymax, xmax].
+The box must enclose the ENTIRE component including all visible surfaces.
 
-Return the bounding box in NORMALIZED coordinates scaled from 0 to 1000.
+Also provide "arrow_origin": [y, x] — the point where a user would interact with this component.
+{f'Specifically: {arrow_origin_hint}.' if arrow_origin_hint else ''}
 
-Use the format [ymin, xmin, ymax, xmax] where:
-- ymin: top edge (0 = top of image, 1000 = bottom)
-- xmin: left edge (0 = left of image, 1000 = right)
-- ymax: bottom edge
-- xmax: right edge
+Respond with single-line compact JSON only:
+{{"name": "{task}", "bbox": [ymin, xmin, ymax, xmax], "arrow_origin": [y, x]}}
 
-The box must TIGHTLY enclose the ENTIRE {task} with a small margin (~3%).
-Be very precise about the boundaries.
-
-Respond ONLY with JSON:
-{{"name": "{task}", "bbox": [ymin, xmin, ymax, xmax]}}
-
-If not found:
-{{"name": "not_found", "bbox": [0, 0, 0, 0]}}"""
+If not found: {{"name": "not_found", "bbox": [0,0,0,0], "arrow_origin": [0,0]}}"""
 
     stage_label = "Stage 2" if parent_bbox_norm else "Single-stage"
     print(f"  [Gemini] {stage_label}: Detecting '{task}'...")
@@ -307,6 +304,20 @@ If not found:
     cx = (pixel_bbox[0] + pixel_bbox[2]) / 2
     cy = (pixel_bbox[1] + pixel_bbox[3]) / 2
 
+    # arrow_origin の解析 (正規化 [y, x] → ピクセル [x, y])
+    arrow_origin_pixel = None
+    raw_origin = data.get("arrow_origin")
+    if raw_origin and len(raw_origin) == 2:
+        oy_norm, ox_norm = float(raw_origin[0]), float(raw_origin[1])
+        if oy_norm > 0 or ox_norm > 0:  # [0,0] は未検出扱い
+            oy_norm = max(0, min(oy_norm, 1000))
+            ox_norm = max(0, min(ox_norm, 1000))
+            arrow_origin_pixel = [
+                ox_norm / 1000.0 * image_width,
+                oy_norm / 1000.0 * image_height,
+            ]
+            print(f"  [Gemini] Arrow origin (norm): [y={oy_norm:.0f}, x={ox_norm:.0f}] → pixel: ({arrow_origin_pixel[0]:.0f}, {arrow_origin_pixel[1]:.0f})")
+
     confidence = "high" if parent_bbox_norm else "medium"
 
     print(f"  [Gemini] {stage_label}: norm bbox = {target_bbox_norm}")
@@ -317,4 +328,5 @@ If not found:
         bbox=pixel_bbox,
         center=[cx, cy],
         confidence=confidence,
+        arrow_origin=arrow_origin_pixel,
     )]

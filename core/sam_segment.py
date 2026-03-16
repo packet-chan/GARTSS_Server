@@ -1,6 +1,8 @@
 """
 SAM2 セグメンテーションモジュール
 BBoxプロンプトからピクセルマスクを生成し、輪郭を3D座標に変換する
+
+v2: 方向別マージン対応 + 小領域ノイズ除去
 """
 
 import numpy as np
@@ -54,6 +56,7 @@ def segment_with_bbox(
     image_bgr: np.ndarray,
     bbox: list[float],
     margin_ratio: float = 0.1,
+    margin_ratios: dict | None = None,
 ) -> dict:
     """
     BBoxプロンプトでSAM2セグメンテーションを実行
@@ -61,7 +64,10 @@ def segment_with_bbox(
     Args:
         image_bgr: BGR画像 (OpenCV形式)
         bbox: [x_min, y_min, x_max, y_max] ピクセル座標
-        margin_ratio: BBoxを各方向に何%広げるか (0.1 = 10%)
+        margin_ratio: BBoxを各方向に何%広げるか (0.1 = 10%)。
+                      margin_ratios が指定されている場合はそちらが優先。
+        margin_ratios: 方向別マージン比率 {"top": 0.05, "bottom": 0.3, "left": 0.1, "right": 0.1}
+                       指定しない方向は margin_ratio がフォールバックとして使われる。
 
     Returns:
         {
@@ -83,15 +89,30 @@ def segment_with_bbox(
     x_min, y_min, x_max, y_max = bbox
     bw = x_max - x_min
     bh = y_max - y_min
-    mx = bw * margin_ratio
-    my = bh * margin_ratio
+
+    # 方向別マージン
+    if margin_ratios is not None:
+        m_top = bh * margin_ratios.get("top", margin_ratio)
+        m_bottom = bh * margin_ratios.get("bottom", margin_ratio)
+        m_left = bw * margin_ratios.get("left", margin_ratio)
+        m_right = bw * margin_ratios.get("right", margin_ratio)
+    else:
+        m_top = bh * margin_ratio
+        m_bottom = bh * margin_ratio
+        m_left = bw * margin_ratio
+        m_right = bw * margin_ratio
+
     expanded_bbox = [
-        max(0, x_min - mx),
-        max(0, y_min - my),
-        min(w, x_max + mx),
-        min(h, y_max + my),
+        max(0, x_min - m_left),
+        max(0, y_min - m_top),
+        min(w, x_max + m_right),
+        min(h, y_max + m_bottom),
     ]
-    print(f"  [SAM2] BBox: [{x_min:.0f},{y_min:.0f},{x_max:.0f},{y_max:.0f}] → expanded: [{expanded_bbox[0]:.0f},{expanded_bbox[1]:.0f},{expanded_bbox[2]:.0f},{expanded_bbox[3]:.0f}] (margin={margin_ratio*100:.0f}%)")
+    print(f"  [SAM2] BBox: [{x_min:.0f},{y_min:.0f},{x_max:.0f},{y_max:.0f}] "
+          f"→ expanded: [{expanded_bbox[0]:.0f},{expanded_bbox[1]:.0f},"
+          f"{expanded_bbox[2]:.0f},{expanded_bbox[3]:.0f}] "
+          f"(margins: top={m_top:.0f}, bottom={m_bottom:.0f}, "
+          f"left={m_left:.0f}, right={m_right:.0f})")
 
     # BBoxプロンプト
     input_box = np.array(expanded_bbox)  # [x_min, y_min, x_max, y_max]
@@ -104,6 +125,44 @@ def segment_with_bbox(
 
     mask = masks[0]  # (H, W) bool
     score = float(scores[0])
+
+    # === BBox クリッピング ===
+    # SAM にはexpanded BBoxを渡すが、結果は元のBBox範囲にクリップ。
+    # expanded 領域にはみ出したセグメントは対象物ではない可能性が高い。
+    bbox_clipped = mask.copy()
+    x_min_i, y_min_i = int(round(x_min)), int(round(y_min))
+    x_max_i, y_max_i = int(round(x_max)), int(round(y_max))
+    bbox_clipped[:y_min_i, :] = False
+    bbox_clipped[y_max_i:, :] = False
+    bbox_clipped[:, :x_min_i] = False
+    bbox_clipped[:, x_max_i:] = False
+
+    clipped_pixels = np.count_nonzero(mask) - np.count_nonzero(bbox_clipped)
+    if clipped_pixels > 0:
+        print(f"  [SAM2] BBox clipping removed {clipped_pixels} pixels outside original BBox")
+    mask = bbox_clipped
+
+    # === 最大連結成分のみ保持 ===
+    total_mask_pixels = np.count_nonzero(mask)
+    if total_mask_pixels > 0:
+        mask_u8 = (mask * 255).astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+
+        if num_labels > 2:  # 背景 + 2つ以上の領域がある場合
+            # 最大の連結成分のみ残す
+            largest_label = 0
+            largest_area = 0
+            for label_id in range(1, num_labels):
+                area = stats[label_id, cv2.CC_STAT_AREA]
+                if area > largest_area:
+                    largest_area = area
+                    largest_label = label_id
+
+            noise_removed = total_mask_pixels - largest_area
+            mask = (labels == largest_label)
+            if noise_removed > 0:
+                print(f"  [SAM2] Kept largest component only: removed {noise_removed} pixels "
+                      f"({noise_removed / total_mask_pixels * 100:.1f}%) from {num_labels - 1} regions")
 
     # 輪郭を抽出
     mask_u8 = (mask * 255).astype(np.uint8)
@@ -193,6 +252,8 @@ def mask_to_point_cloud(
     engine,
     image_bgr: np.ndarray = None,
     sample_step: int = 1,
+    sor_neighbors: int = 20,
+    sor_std_ratio: float = 2.0,
 ) -> dict:
     """
     SAM マスク領域内の全有効ピクセルを 3D 点群に変換する。
@@ -202,6 +263,8 @@ def mask_to_point_cloud(
         engine: AlignmentEngine (get_3d_points_batch, _aligned_depth を持つ)
         image_bgr: BGR 画像 (色付き点群にする場合)
         sample_step: ピクセルサンプリング間隔 (1=全ピクセル, 2=1/4, 3=1/9...)
+        sor_neighbors: 統計的外れ値除去の近傍数 (0で無効化)
+        sor_std_ratio: 平均距離 + std_ratio * 標準偏差 より遠い点を外れ値とする
 
     Returns:
         {
@@ -242,6 +305,30 @@ def mask_to_point_cloud(
         # BGR → RGB
         colors_bgr = image_bgr[v_valid, u_valid]
         colors = colors_bgr[:, ::-1].copy()  # BGR → RGB
+
+    # === 統計的外れ値除去 (SOR) ===
+    # Depth のノイズで飛び散った点を除去する。
+    # 各点の k 近傍までの平均距離を計算し、
+    # mean + std_ratio * std より遠い点を外れ値として除去。
+    if sor_neighbors > 0 and len(points_unity) > sor_neighbors:
+        from scipy.spatial import KDTree
+        tree = KDTree(points_unity)
+        dists, _ = tree.query(points_unity, k=sor_neighbors + 1)  # 自分自身を含む
+        mean_dists = dists[:, 1:].mean(axis=1)  # 自分自身(0距離)を除く
+
+        global_mean = mean_dists.mean()
+        global_std = mean_dists.std()
+        threshold = global_mean + sor_std_ratio * global_std
+
+        inlier_mask = mean_dists < threshold
+        n_before = len(points_unity)
+        points_unity = points_unity[inlier_mask]
+        if colors is not None:
+            colors = colors[inlier_mask]
+        n_removed = n_before - len(points_unity)
+        if n_removed > 0:
+            print(f"  [PointCloud] SOR: removed {n_removed} outliers "
+                  f"({n_removed / n_before * 100:.1f}%), threshold={threshold:.5f}m")
 
     return {
         "points": points_unity,

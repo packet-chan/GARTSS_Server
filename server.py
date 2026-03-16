@@ -2,6 +2,8 @@
 GARTSS Server
 Quest 3からのRGB+Depthデータを受け取り、3D再投影アライメントを行う。
 キャプチャごとに可視化画像を保存。
+
+v2: arrow_origin + compute_local_normal による局所法線ベースの方向決定
 """
 
 import io
@@ -18,7 +20,7 @@ from PIL import Image
 from core.alignment import AlignmentEngine
 from core.gemini import detect_objects
 from core.sam_segment import segment_with_bbox, mask_contour_to_3d, save_mask_visualization, mask_to_point_cloud, save_ply
-from core.normal_estimator import compute_surface_normal, compute_action_direction, compute_arrow_start
+from core.normal_estimator import compute_surface_normal, compute_local_normal, compute_action_direction, compute_arrow_start
 from core.action_mapping import get_action_config
 from core.depth_path import compute_pull_guide_path, project_3d_direction_to_2d
 from core.mesh_generator import pointcloud_to_mesh
@@ -36,7 +38,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 app = FastAPI(
     title="GARTSS Server",
     description="Zero-shot AR Authoring - Quest 3 RGB-Depth Alignment",
-    version="0.2.0",
+    version="0.3.0",
 )
 
 app.add_middleware(
@@ -340,7 +342,14 @@ async def analyze(session_id: str):
         pc_result = {"count": 0, "points": np.zeros((0, 3)), "colors": None}
         if rgb_bgr is not None:
             try:
-                sam_result = segment_with_bbox(rgb_bgr, det.bbox)
+                # タスクに応じた方向別SAMマージンを取得
+                action_config = get_action_config(task)
+                sam_margins = action_config.get("sam_margin_ratios", None)
+
+                sam_result = segment_with_bbox(
+                    rgb_bgr, det.bbox,
+                    margin_ratios=sam_margins,
+                )
                 contour_3d = mask_contour_to_3d(
                     sam_result["contours"], engine,
                     simplify_epsilon=5.0,
@@ -394,11 +403,52 @@ async def analyze(session_id: str):
                 if latest_pose is not None:
                     camera_pos = np.array(latest_pose[0])
 
-                # PCA で法線推定
-                normal_result = compute_surface_normal(
-                    points=pc_result["points"],
-                    camera_position=camera_pos,
-                )
+                # === arrow_origin を BBox + action_type から決定論的に計算 ===
+                # Gemini の arrow_origin は精度が不安定なので、
+                # BBox の幾何情報と action_type から確実な位置を計算する。
+                action_config = get_action_config(task)
+                action_type = action_config["action_type"]
+                x_min_b, y_min_b, x_max_b, y_max_b = det.bbox
+                bbox_cx = (x_min_b + x_max_b) / 2
+                bbox_cy = (y_min_b + y_max_b) / 2
+
+                if action_type == "pull":
+                    # pull: 前面の中央 = BBox 下部 75% の位置
+                    ao_u = bbox_cx
+                    ao_v = y_min_b + (y_max_b - y_min_b) * 0.75
+                elif action_type in ("rotate_cw", "rotate_ccw"):
+                    # rotate: BBox 中央
+                    ao_u = bbox_cx
+                    ao_v = bbox_cy
+                elif action_type in ("push", "press"):
+                    # press/push: BBox 中央
+                    ao_u = bbox_cx
+                    ao_v = bbox_cy
+                else:
+                    ao_u = bbox_cx
+                    ao_v = bbox_cy
+
+                arrow_origin_2d = [ao_u, ao_v]
+                arrow_origin_3d = engine.get_3d_point_unity(ao_u, ao_v)
+
+                if arrow_origin_3d is not None:
+                    print(f"    Arrow origin ({action_type}): 2D=({ao_u:.0f}, {ao_v:.0f}) → 3D=[{arrow_origin_3d[0]:.4f}, {arrow_origin_3d[1]:.4f}, {arrow_origin_3d[2]:.4f}]")
+                else:
+                    print(f"    Arrow origin ({action_type}): 2D=({ao_u:.0f}, {ao_v:.0f}) → No depth")
+
+                # === 局所法線推定 (arrow_origin 周辺) ===
+                if arrow_origin_3d is not None:
+                    normal_result = compute_local_normal(
+                        points=pc_result["points"],
+                        query_point=arrow_origin_3d,
+                        radius_m=0.03,
+                        camera_position=camera_pos,
+                    )
+                else:
+                    normal_result = compute_surface_normal(
+                        points=pc_result["points"],
+                        camera_position=camera_pos,
+                    )
 
                 if normal_result["valid"]:
                     # タスクに応じた操作方向を取得
@@ -412,17 +462,20 @@ async def analyze(session_id: str):
 
                     # Depth 沿いのガイドパス生成
                     guide_path = None
+                    # ガイドパスの起点: arrow_origin があればそれを使う
+                    guide_origin_u = arrow_origin_2d[0] if arrow_origin_2d else u
+                    guide_origin_v = arrow_origin_2d[1] if arrow_origin_2d else v
                     if action_config["action_type"] == "pull":
                         # 3D 操作方向を 2D に射影
                         dir_2d = project_3d_direction_to_2d(
                             engine=engine,
-                            centroid_2d=(u, v),
+                            centroid_2d=(guide_origin_u, guide_origin_v),
                             direction_3d=action_dir,
                         )
                         if dir_2d is not None:
                             guide_path = compute_pull_guide_path(
                                 engine=engine,
-                                centroid_2d=(u, v),
+                                centroid_2d=(guide_origin_u, guide_origin_v),
                                 action_direction_2d=dir_2d,
                                 arrow_length_m=action_config["arrow_length_m"],
                             )
@@ -435,14 +488,17 @@ async def analyze(session_id: str):
                         for pt in guide_path:
                             guide_path_flat.extend(pt)
 
-                    # 矢印の開始位置を計算 (前端 + 法線オフセット)
-                    arrow_start = compute_arrow_start(
-                        points=pc_result["points"],
-                        centroid=normal_result["centroid"],
-                        action_direction=action_dir,
-                        normal=normal_result["normal"],
-                        offset_m=0.03,
-                    )
+                    # 矢印の開始位置: arrow_origin_3d があればそれ + 法線オフセット
+                    if arrow_origin_3d is not None:
+                        arrow_start = arrow_origin_3d + normal_result["normal"] * 0.03
+                    else:
+                        arrow_start = compute_arrow_start(
+                            points=pc_result["points"],
+                            centroid=normal_result["centroid"],
+                            action_direction=action_dir,
+                            normal=normal_result["normal"],
+                            offset_m=0.03,
+                        )
 
                     surface_info = SurfaceInfo(
                         centroid_3d=normal_result["centroid"].tolist(),
@@ -460,6 +516,7 @@ async def analyze(session_id: str):
                     print(f"    Action: {action_config['action_type']} → [{action_dir[0]:.4f}, {action_dir[1]:.4f}, {action_dir[2]:.4f}]")
                     print(f"    Arrow start: [{arrow_start[0]:.4f}, {arrow_start[1]:.4f}, {arrow_start[2]:.4f}]")
                     print(f"    Planarity: {normal_result['planarity']:.4f}")
+                    print(f"    Method: {'local_normal' if arrow_origin_3d is not None else 'global_pca'}")
                 else:
                     print(f"    [Normal] Estimation not reliable (planarity={normal_result['planarity']:.4f})")
             except Exception as e:
@@ -486,7 +543,7 @@ async def analyze(session_id: str):
         print(f"    Contour 3D vertices: {len(contour_3d)}")
 
     # 可視化: BBoxをRGB画像に描画して保存
-    _save_analyze_visualization(session, detections)
+    _save_analyze_visualization(session, detections, task)
 
     return AnalyzeResponse(
         objects=objects,
@@ -494,8 +551,8 @@ async def analyze(session_id: str):
     )
 
 
-def _save_analyze_visualization(session, detections):
-    """検出結果をRGB画像に描画して保存"""
+def _save_analyze_visualization(session, detections, task=""):
+    """検出結果をRGB画像に描画して保存。BBox + center + 計算済みarrow_origin を表示。"""
     rgb_data = session.get("latest_rgb")
     if rgb_data is None:
         return
@@ -507,15 +564,37 @@ def _save_analyze_visualization(session, detections):
         if img_array is None:
             return
 
-        # BBoxを描画
+        action_config = get_action_config(task)
+        action_type = action_config.get("action_type", "pull")
+
         for det in detections:
             x1, y1, x2, y2 = [int(v) for v in det.bbox]
             cx, cy = int(det.center[0]), int(det.center[1])
 
+            # BBox (緑)
             cv2.rectangle(img_array, (x1, y1), (x2, y2), (0, 255, 0), 3)
+            # Center (赤丸)
             cv2.circle(img_array, (cx, cy), 8, (0, 0, 255), -1)
+            # ラベル
             cv2.putText(img_array, det.name, (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+            # BBox から計算した arrow_origin (シアン ◆)
+            x_min_b, y_min_b, x_max_b, y_max_b = det.bbox
+            if action_type == "pull":
+                ao_x = int((x_min_b + x_max_b) / 2)
+                ao_y = int(y_min_b + (y_max_b - y_min_b) * 0.75)
+            else:
+                ao_x = int((x_min_b + x_max_b) / 2)
+                ao_y = int((y_min_b + y_max_b) / 2)
+
+            diamond = np.array([
+                [ao_x, ao_y - 12], [ao_x + 12, ao_y],
+                [ao_x, ao_y + 12], [ao_x - 12, ao_y],
+            ], dtype=np.int32)
+            cv2.fillPoly(img_array, [diamond], (255, 255, 0))  # シアン (BGR)
+            cv2.putText(img_array, "origin", (ao_x + 15, ao_y + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
         output_path = session_dir / "analyze_result.png"
         cv2.imwrite(str(output_path), img_array)

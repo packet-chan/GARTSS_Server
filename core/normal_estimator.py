@@ -3,6 +3,9 @@ Surface Normal 推定モジュール
 
 点群データから PCA (主成分分析) を使ってサーフェスの法線方向を推定し、
 タスクに応じた操作方向（引き出し・回転・押下）を計算する。
+
+v2: compute_local_normal を追加。arrow_origin 周辺の局所法線を推定。
+    compute_action_direction を法線ベースに統一。
 """
 
 import numpy as np
@@ -32,7 +35,81 @@ def compute_surface_normal(
             "valid": bool,                      — 推定が信頼できるか
         }
     """
-    if points is None or len(points) < 10:
+    return _pca_normal(points, camera_position, min_points=50, min_planarity=0.8)
+
+
+def compute_local_normal(
+    points: np.ndarray,
+    query_point: np.ndarray,
+    radius_m: float = 0.03,
+    camera_position: Optional[np.ndarray] = None,
+) -> dict:
+    """
+    指定した3D点の周辺の点群から局所的な法線を推定する。
+
+    Gemini が指定した arrow_origin の 3D 座標周辺の点を使い、
+    その局所面の法線を PCA で求める。部品全体の PCA ではなく
+    矢印起点付近の面の向きを正確に反映する。
+
+    Args:
+        points: (N, 3) float64 — 部品全体の点群 (Unity ワールド座標系)
+        query_point: (3,) float64 — 法線を求めたい位置 (arrow_origin の 3D 座標)
+        radius_m: float — query_point 周辺の検索半径 [m]
+        camera_position: (3,) カメラ位置 (Unity座標系)
+
+    Returns:
+        compute_surface_normal と同じ辞書。
+        十分な近傍点がない場合は全体 PCA にフォールバック。
+    """
+    if points is None or len(points) < 10 or query_point is None:
+        return _pca_normal(points, camera_position, min_points=50, min_planarity=0.8)
+
+    # query_point 周辺 radius_m 以内の点を抽出
+    dists = np.linalg.norm(points - query_point, axis=1)
+    local_mask = dists <= radius_m
+    local_points = points[local_mask]
+
+    print(f"    [LocalNormal] query={query_point}, r={radius_m}m, "
+          f"nearby={len(local_points)}/{len(points)}")
+
+    # 近傍点が少ない場合、半径を段階的に拡大して再試行
+    for expanded_r in [radius_m * 2, radius_m * 3]:
+        if len(local_points) >= 20:
+            break
+        local_mask = dists <= expanded_r
+        local_points = points[local_mask]
+        print(f"    [LocalNormal] Expanded radius to {expanded_r:.3f}m → {len(local_points)} points")
+
+    # それでも足りなければ全体 PCA にフォールバック
+    if len(local_points) < 20:
+        print(f"    [LocalNormal] Not enough local points, falling back to global PCA")
+        return _pca_normal(points, camera_position, min_points=50, min_planarity=0.8)
+
+    result = _pca_normal(local_points, camera_position, min_points=10, min_planarity=0.6)
+
+    if not result["valid"]:
+        print(f"    [LocalNormal] Local PCA not valid (planarity={result['planarity']:.4f}), "
+              f"falling back to global PCA")
+        return _pca_normal(points, camera_position, min_points=50, min_planarity=0.8)
+
+    print(f"    [LocalNormal] Local normal: [{result['normal'][0]:.4f}, "
+          f"{result['normal'][1]:.4f}, {result['normal'][2]:.4f}], "
+          f"planarity={result['planarity']:.4f}")
+    return result
+
+
+def _pca_normal(
+    points: np.ndarray,
+    camera_position: Optional[np.ndarray] = None,
+    min_points: int = 50,
+    min_planarity: float = 0.8,
+) -> dict:
+    """
+    PCA ベースの法線推定の共通実装。
+
+    compute_surface_normal と compute_local_normal の両方から呼ばれる。
+    """
+    if points is None or len(points) < max(10, min_points // 5):
         return {
             "centroid": np.zeros(3),
             "normal": np.array([0.0, 1.0, 0.0]),  # デフォルト: 上向き
@@ -73,9 +150,7 @@ def compute_surface_normal(
         planarity = 0.0
 
     # 5. 信頼性判定
-    #    - 点が十分にある (>= 50)
-    #    - 面がある程度平面 (planarity >= 0.8)
-    valid = len(points) >= 50 and planarity >= 0.8
+    valid = len(points) >= min_points and planarity >= min_planarity
 
     return {
         "centroid": centroid,
@@ -96,45 +171,40 @@ def compute_action_direction(
     """
     Surface Normal とアクションタイプから操作方向ベクトルを計算する。
 
+    改善: すべてのアクションタイプで局所法線ベクトルを基準に方向を決定する。
+    compute_local_normal で求めた局所法線が渡されることを想定。
+
     Args:
         normal: (3,) 単位法線ベクトル (Unity座標系、カメラ側向き)
         action_type: "pull" | "push" | "press" | "rotate_cw" | "rotate_ccw"
-        camera_position: (3,) カメラ位置
-        centroid: (3,) 面の重心
+        camera_position: (3,) カメラ位置 (未使用、互換性のため残す)
+        centroid: (3,) 面の重心 (未使用、互換性のため残す)
 
     Returns:
         (3,) 操作方向の単位ベクトル (Unity座標系)
     """
-    if camera_position is None:
-        camera_position = np.zeros(3)
-    if centroid is None:
-        centroid = np.zeros(3)
+    n = normal / max(np.linalg.norm(normal), 1e-8)
 
     if action_type == "pull":
-        # 引き出す = カメラ方向を水平面に射影
-        # トレーやタンクは水平に引き出すものなので、Y成分を0にして水平に限定
-        to_camera = camera_position - centroid
-        to_camera[1] = 0  # Y成分を除去 → 水平方向のみ
-        norm = np.linalg.norm(to_camera)
-        if norm < 1e-6:
-            return np.array([0.0, 0.0, 1.0])
-        return to_camera / norm
+        # 引き出す = 法線方向 (面から手前に引く)
+        # 局所法線が面の向きを正確に反映するので、そのまま使う
+        return n
 
     elif action_type == "push" or action_type == "press":
         # 押す = Normal の逆方向（面に向かって押し込む）
-        return -normal / max(np.linalg.norm(normal), 1e-8)
+        return -n
 
     elif action_type == "rotate_cw":
         # 時計回り = Normal 方向そのまま（右ねじの法則: Normal方向から見てCW）
-        return normal / max(np.linalg.norm(normal), 1e-8)
+        return n
 
     elif action_type == "rotate_ccw":
         # 反時計回り = Normal の逆
-        return -normal / max(np.linalg.norm(normal), 1e-8)
+        return -n
 
     else:
         # フォールバック: Normal 方向
-        return normal / max(np.linalg.norm(normal), 1e-8)
+        return n
 
 
 def compute_arrow_start(
