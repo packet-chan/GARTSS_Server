@@ -307,14 +307,11 @@ def mask_to_point_cloud(
         colors = colors_bgr[:, ::-1].copy()  # BGR → RGB
 
     # === 統計的外れ値除去 (SOR) ===
-    # Depth のノイズで飛び散った点を除去する。
-    # 各点の k 近傍までの平均距離を計算し、
-    # mean + std_ratio * std より遠い点を外れ値として除去。
     if sor_neighbors > 0 and len(points_unity) > sor_neighbors:
         from scipy.spatial import KDTree
         tree = KDTree(points_unity)
-        dists, _ = tree.query(points_unity, k=sor_neighbors + 1)  # 自分自身を含む
-        mean_dists = dists[:, 1:].mean(axis=1)  # 自分自身(0距離)を除く
+        dists, _ = tree.query(points_unity, k=sor_neighbors + 1)
+        mean_dists = dists[:, 1:].mean(axis=1)
 
         global_mean = mean_dists.mean()
         global_std = mean_dists.std()
@@ -329,6 +326,59 @@ def mask_to_point_cloud(
         if n_removed > 0:
             print(f"  [PointCloud] SOR: removed {n_removed} outliers "
                   f"({n_removed / n_before * 100:.1f}%), threshold={threshold:.5f}m")
+
+    # === DBSCAN クラスタリング ===
+    # SOR は孤立した外れ値を除去するが、線状に連続したノイズ（Depthエッジ）は残る。
+    # 空間的に分離した小さなクラスタを検出・除去する。
+    # 注意: eps が小さすぎると主要部品の疎な部分まで切り落とすので、
+    #       倍率を大きめに設定し、全体の5%未満のクラスタだけ除去する。
+    if len(points_unity) > 100:
+        from scipy.spatial import KDTree as KDT
+
+        try:
+            tree2 = KDT(points_unity)
+            # eps: k=10 近傍距離の 75 パーセンタイルの 3 倍
+            # 疎な領域でも連結を維持するために余裕を持たせる
+            k_dists, _ = tree2.query(points_unity, k=min(11, len(points_unity)))
+            eps = float(np.percentile(k_dists[:, -1], 75)) * 3.0
+
+            from scipy.sparse import lil_matrix
+            from scipy.sparse.csgraph import connected_components
+
+            n_pts = len(points_unity)
+            neighbors = tree2.query_ball_tree(tree2, r=eps)
+            adj = lil_matrix((n_pts, n_pts), dtype=bool)
+            for i, nbrs in enumerate(neighbors):
+                for j in nbrs:
+                    if i != j:
+                        adj[i, j] = True
+
+            n_components, labels = connected_components(adj, directed=False)
+
+            if n_components > 1:
+                unique, counts = np.unique(labels, return_counts=True)
+                # 全体の 5% 未満のクラスタのみ除去（大きなクラスタは残す）
+                min_cluster_size = int(n_pts * 0.05)
+                keep_mask = np.ones(n_pts, dtype=bool)
+                n_small_clusters = 0
+                for label_id, count in zip(unique, counts):
+                    if count < min_cluster_size:
+                        keep_mask[labels == label_id] = False
+                        n_small_clusters += 1
+
+                n_before_cluster = len(points_unity)
+                points_unity = points_unity[keep_mask]
+                if colors is not None:
+                    colors = colors[keep_mask]
+                n_cluster_removed = n_before_cluster - len(points_unity)
+                if n_cluster_removed > 0:
+                    print(f"  [PointCloud] DBSCAN: {n_components} clusters, "
+                          f"removed {n_small_clusters} small (<{min_cluster_size} pts), "
+                          f"{n_cluster_removed} pts removed (eps={eps:.4f}m)")
+                else:
+                    print(f"  [PointCloud] DBSCAN: {n_components} clusters, all large enough to keep")
+        except Exception as e:
+            print(f"  [PointCloud] DBSCAN failed (non-critical): {e}")
 
     return {
         "points": points_unity,

@@ -23,7 +23,7 @@ from core.sam_segment import segment_with_bbox, mask_contour_to_3d, save_mask_vi
 from core.normal_estimator import compute_surface_normal, compute_local_normal, compute_action_direction, compute_arrow_start
 from core.action_mapping import get_action_config
 from core.depth_path import compute_pull_guide_path, project_3d_direction_to_2d
-from core.mesh_generator import pointcloud_to_mesh
+from core.mesh_generator import pointcloud_to_mesh, compute_texture_projection
 from models.schemas import (
     SessionInitRequest, SessionInitResponse,
     DepthDescriptor, HMDPose,
@@ -388,6 +388,8 @@ async def analyze(session_id: str):
                         "points": pc_result["points"],
                         "colors": pc_result["colors"],
                         "reference_3d": point_3d.tolist() if point_3d is not None else None,
+                        "bbox": det.bbox,
+                        "sam_mask": sam_result["mask"],  # テクスチャマスキング用
                     }
 
             except Exception as e:
@@ -722,6 +724,37 @@ async def get_mesh(session_id: str, object_name: str, target_triangles: int = 50
         verts = verts + offset
         mesh_data["vertices"] = verts.flatten().tolist()
         print(f"  [Mesh] Offset correction: [{offset[0]:.4f}, {offset[1]:.4f}, {offset[2]:.4f}]")
+
+    # === テクスチャ投影 ===
+    # RGB 画像と BBox がセッションにあればテクスチャを生成
+    engine: AlignmentEngine = session["engine"]
+    rgb_data = session.get("latest_rgb")
+    bbox = pc_data.get("bbox")
+    sam_mask = pc_data.get("sam_mask")
+
+    if rgb_data is not None and bbox is not None:
+        try:
+            rgb_bgr = decode_rgb(rgb_data)
+            if rgb_bgr is not None:
+                verts_for_uv = np.array(mesh_data["vertices"]).reshape(-1, 3)
+                tex_result = compute_texture_projection(
+                    mesh_vertices=verts_for_uv,
+                    engine=engine,
+                    image_bgr=rgb_bgr,
+                    bbox=bbox,
+                    sam_mask=sam_mask,
+                )
+                if tex_result is not None:
+                    mesh_data["uvs"] = tex_result["uvs"]
+                    mesh_data["texture_base64"] = tex_result["texture_base64"]
+                    mesh_data["texture_width"] = tex_result["texture_width"]
+                    mesh_data["texture_height"] = tex_result["texture_height"]
+                    print(f"  [Mesh] Texture attached: {tex_result['texture_width']}x{tex_result['texture_height']}, "
+                          f"UV valid: {tex_result['uv_valid_ratio']*100:.1f}%")
+                else:
+                    print(f"  [Mesh] Texture projection failed, using vertex colors only")
+        except Exception as e:
+            print(f"  [Mesh] Texture error: {e}, using vertex colors only")
 
     return mesh_data
 
