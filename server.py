@@ -287,26 +287,27 @@ async def depth_query(session_id: str, u: float, v: float):
 
 @app.post("/session/{session_id}/analyze", response_model=AnalyzeResponse)
 async def analyze(session_id: str):
-    """Gemini APIでRGB画像を解析し、検出物体の3D座標を返す"""
+    """Analyze RGB image using Gemini API and return 3D coordinates of detected objects."""
+    # Verify session exists
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
     session = sessions[session_id]
     engine: AlignmentEngine = session["engine"]
 
-    # 最新のRGB画像を取得
+    # Get the latest RGB image saved during capture
     rgb_data = session.get("latest_rgb")
     if rgb_data is None:
         raise HTTPException(status_code=400, detail="No RGB image captured yet. Capture first.")
 
-    # タスクはサーバー側で管理（PDFから自動生成予定）
+    # Task is managed server-side (will be auto-generated from PDF in the future)
     task = session.get("current_task", "drip_tray")
 
     print(f"\n=== Analyze (session {session_id}) ===")
     print(f"  Task: {task}")
     print(f"  RGB data: {len(rgb_data)} bytes")
 
-    # Gemini APIで検出
+    # Detect target object using Gemini API (2-stage detection)
     try:
         detections = await detect_objects(
             image_bytes=rgb_data,
@@ -318,38 +319,41 @@ async def analyze(session_id: str):
         print(f"  [Analyze] Gemini API error: {e}")
         raise HTTPException(status_code=500, detail=f"Gemini API error: {e}")
 
-    # RGB画像をデコード (SAM用)
+    # Decode RGB image for SAM segmentation
     session_dir = session["dir"]
     rgb_bgr = decode_rgb(rgb_data)
 
-    # 検出結果に3D座標を付与 + SAMセグメンテーション
+    # Process each detected object
     objects = []
     for det in detections:
         u, v = det.center[0], det.center[1]
 
-        # Depthから3D座標を取得
+        # Get 3D position from aligned depth at detection center
         point_3d = engine.get_3d_point_unity(u, v)
         depth_m = engine.get_depth_at_pixel(u, v)
 
-        # SAMでBBox内をセグメンテーション
+        # Initialize empty results
         contour_3d = []
         pc_result = {"count": 0, "points": np.zeros((0, 3)), "colors": None}
         if rgb_bgr is not None:
             try:
-                # タスクに応じた方向別SAMマージンを取得
+                # Get SAM margin ratios for this task
                 action_config = get_action_config(task)
                 sam_margins = action_config.get("sam_margin_ratios", None)
 
+                # Segment the object within the bounding box
                 sam_result = segment_with_bbox(
                     rgb_bgr, det.bbox,
                     margin_ratios=sam_margins,
                 )
+
+                # Convert 2D contour to 3D coordinates
                 contour_3d = mask_contour_to_3d(
                     sam_result["contours"], engine,
                     simplify_epsilon=5.0,
                 )
 
-                # マスク可視化を保存
+                # Save segmentation visualization for debugging
                 save_mask_visualization(
                     rgb_bgr, sam_result["mask"], sam_result["contours"],
                     det.bbox,
@@ -357,14 +361,15 @@ async def analyze(session_id: str):
                     label=det.name,
                 )
 
-                # === 点群生成 & PLY 保存 ===
+                # Generate point cloud from segmentation mask
                 pc_result = mask_to_point_cloud(
                     mask=sam_result["mask"],
                     engine=engine,
                     image_bgr=rgb_bgr,
-                    sample_step=2,  # 1/4 サンプリングで速度と密度のバランス
+                    sample_step=2,  # Sample every 2 pixels (1/4 density) for speed
                 )
                 if pc_result["count"] > 0:
+                    # Save point cloud as PLY file
                     ply_path = str(session_dir / f"pointcloud_{det.name}.ply")
                     save_ply(
                         output_path=ply_path,
@@ -373,9 +378,9 @@ async def analyze(session_id: str):
                     )
                     print(f"    Point cloud: {pc_result['count']} points → {ply_path}")
 
-                    # メッシュ生成用に点群をセッションに保存
-                    # reference_3d: get_3d_point_unity (メディアンDepth) で求めた正確な3D位置
-                    # 点群の centroid とのオフセットを補正に使う
+                    # Store point cloud in session for mesh generation endpoint
+                    # reference_3d: accurate 3D position from median depth (get_3d_point_unity)
+                    # Used to correct offset between point cloud centroid and true position
                     if "point_clouds" not in session:
                         session["point_clouds"] = {}
                     session["point_clouds"][det.name] = {
@@ -383,25 +388,23 @@ async def analyze(session_id: str):
                         "colors": pc_result["colors"],
                         "reference_3d": point_3d.tolist() if point_3d is not None else None,
                         "bbox": det.bbox,
-                        "sam_mask": sam_result["mask"],  # テクスチャマスキング用
+                        "sam_mask": sam_result["mask"],
                     }
 
             except Exception as e:
                 print(f"  [SAM2] Error: {e}")
 
-        # === Surface Normal 推定 & 操作方向計算 ===
         surface_info = None
         if pc_result["count"] > 0:
             try:
-                # HMD 位置をカメラ位置の近似として使用
                 camera_pos = None
                 latest_pose = engine.interpolator.get_latest_pose()
                 if latest_pose is not None:
                     camera_pos = np.array(latest_pose[0])
 
-                # === arrow_origin を BBox + action_type から決定論的に計算 ===
-                # Gemini の arrow_origin は精度が不安定なので、
-                # BBox の幾何情報と action_type から確実な位置を計算する。
+                # === Calculate arrow origin from bounding box geometry ===
+                # Gemini's arrow_origin is unstable, so we compute it deterministically
+                # from the bounding box and action_type instead.
                 action_config = get_action_config(task)
                 action_type = action_config["action_type"]
                 x_min_b, y_min_b, x_max_b, y_max_b = det.bbox
@@ -409,15 +412,12 @@ async def analyze(session_id: str):
                 bbox_cy = (y_min_b + y_max_b) / 2
 
                 if action_type == "pull":
-                    # pull: 前面の中央 = BBox 下部 75% の位置
                     ao_u = bbox_cx
                     ao_v = y_min_b + (y_max_b - y_min_b) * 0.75
                 elif action_type in ("rotate_cw", "rotate_ccw"):
-                    # rotate: BBox 中央
                     ao_u = bbox_cx
                     ao_v = bbox_cy
                 elif action_type in ("push", "press"):
-                    # press/push: BBox 中央
                     ao_u = bbox_cx
                     ao_v = bbox_cy
                 else:
@@ -432,7 +432,7 @@ async def analyze(session_id: str):
                 else:
                     print(f"    Arrow origin ({action_type}): 2D=({ao_u:.0f}, {ao_v:.0f}) → No depth")
 
-                # === 局所法線推定 (arrow_origin 周辺) ===
+                # === Local surface normal estimation around arrow origin ===
                 if arrow_origin_3d is not None:
                     normal_result = compute_local_normal(
                         points=pc_result["points"],
@@ -447,7 +447,7 @@ async def analyze(session_id: str):
                     )
 
                 if normal_result["valid"]:
-                    # タスクに応じた操作方向を取得
+                    # Get action direction based on surface normal and action type
                     action_config = get_action_config(task)
                     action_dir = compute_action_direction(
                         normal=normal_result["normal"],
@@ -456,13 +456,12 @@ async def analyze(session_id: str):
                         centroid=normal_result["centroid"],
                     )
 
-                    # Depth 沿いのガイドパス生成
+                    # Generate guide path along depth for pull action
                     guide_path = None
-                    # ガイドパスの起点: arrow_origin があればそれを使う
                     guide_origin_u = arrow_origin_2d[0] if arrow_origin_2d else u
                     guide_origin_v = arrow_origin_2d[1] if arrow_origin_2d else v
                     if action_config["action_type"] == "pull":
-                        # 3D 操作方向を 2D に射影
+                        # Project 3D action direction onto 2D image plane
                         dir_2d = project_3d_direction_to_2d(
                             engine=engine,
                             centroid_2d=(guide_origin_u, guide_origin_v),
@@ -477,14 +476,14 @@ async def analyze(session_id: str):
                             )
                             print(f"    Guide path: {len(guide_path)} points")
 
-                    # guide_path をフラット化 [x0,y0,z0, x1,y1,z1, ...]
+                    # Flatten guide path to [x0,y0,z0, x1,y1,z1, ...] for Unity
                     guide_path_flat = None
                     if guide_path and len(guide_path) > 0:
                         guide_path_flat = []
                         for pt in guide_path:
                             guide_path_flat.extend(pt)
 
-                    # 矢印の開始位置: arrow_origin_3d があればそれ + 法線オフセット
+                    # Arrow start = arrow origin + small offset along surface normal (3cm)
                     if arrow_origin_3d is not None:
                         arrow_start = arrow_origin_3d + normal_result["normal"] * 0.03
                     else:
@@ -538,7 +537,6 @@ async def analyze(session_id: str):
         print(f"    3D: {point_3d}" if point_3d is not None else "    3D: N/A")
         print(f"    Contour 3D vertices: {len(contour_3d)}")
 
-    # 可視化: BBoxをRGB画像に描画して保存
     _save_analyze_visualization(session, detections, task)
 
     return AnalyzeResponse(
