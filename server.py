@@ -1,11 +1,3 @@
-"""
-GARTSS Server
-Quest 3からのRGB+Depthデータを受け取り、3D再投影アライメントを行う。
-キャプチャごとに可視化画像を保存。
-
-v2: arrow_origin + compute_local_normal による局所法線ベースの方向決定
-"""
-
 import io
 import json
 import uuid
@@ -31,15 +23,10 @@ from models.schemas import (
     AnalyzeRequest, AnalyzeResponse, DetectedObject, SurfaceInfo,
 )
 
-# 保存先ディレクトリ
 OUTPUT_DIR = Path("captures")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(
-    title="GARTSS Server",
-    description="Zero-shot AR Authoring - Quest 3 RGB-Depth Alignment",
-    version="0.3.0",
-)
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,13 +40,13 @@ sessions: dict[str, dict] = {}
 
 
 def decode_rgb(rgb_bytes: bytes, w: int = 1280, h: int = 1280) -> np.ndarray | None:
-    """RGB画像バイト列をデコード。PNG/JPG or YUV_420_888 に対応。戻り値はBGR"""
-    # まずPNG/JPGとしてデコード
+    """Decode RGB image bytes. Supports PNG/JPG or YUV_420_888. Returns BGR."""
+    # Try decoding as PNG/JPG
     img = cv2.imdecode(np.frombuffer(rgb_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is not None:
         return img
 
-    # YUV_420_888 (NV21) として変換
+    # Convert as YUV_420_888 (NV21) if PNG/JPG decoding failed
     y_size = w * h
     if len(rgb_bytes) >= y_size * 3 // 2:
         yuv_data = np.frombuffer(rgb_bytes[:y_size * 3 // 2], dtype=np.uint8)
@@ -71,7 +58,7 @@ def decode_rgb(rgb_bytes: bytes, w: int = 1280, h: int = 1280) -> np.ndarray | N
         print(f"  RGB: YUV_420_888 -> color ({w}x{h})")
         return bgr
 
-    # Y plane のみ（フォールバック）
+    # Fallback: decode as grayscale using Y plane only
     if len(rgb_bytes) >= y_size:
         y_plane = np.frombuffer(rgb_bytes[:y_size], dtype=np.uint8).reshape((h, w))
         bgr = cv2.cvtColor(y_plane, cv2.COLOR_GRAY2BGR)
@@ -84,22 +71,24 @@ def decode_rgb(rgb_bytes: bytes, w: int = 1280, h: int = 1280) -> np.ndarray | N
 
 def save_visualization(session_dir: Path, capture_idx: int, engine: AlignmentEngine,
                        rgb_bytes: bytes | None, depth_raw: np.ndarray, aligned_depth: np.ndarray):
-    """RGB, Depth(raw), Aligned Depth, Overlay を保存"""
+    """Save RGB, raw depth, aligned depth, and overlay images for debugging."""
     prefix = f"cap{capture_idx:03d}"
 
-    # 1. Depth raw (NDC) → カラーマップ
+    # 1. Normalize raw depth (NDC) and apply color map for visualization
     depth_vis = cv2.normalize(depth_raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     depth_colored = cv2.applyColorMap(depth_vis, cv2.COLORMAP_TURBO)
     cv2.imwrite(str(session_dir / f"{prefix}_depth_raw.png"), depth_colored)
     print(f"  Saved: {prefix}_depth_raw.png ({depth_raw.shape})")
 
-    # 2. Aligned Depth → カラーマップ
+    # 2. Normalize aligned depth and apply color map
+    # Use percentile-based range to avoid outliers skewing the color scale
     valid = aligned_depth[aligned_depth > 0]
     if len(valid) > 0:
         vmin, vmax = np.percentile(valid, [2, 98])
     else:
         vmin, vmax = 0, 5
 
+    # Clip values to [0, 1] range, set invalid pixels (depth=0) to black
     aligned_norm = np.clip((aligned_depth - vmin) / max(vmax - vmin, 0.01), 0, 1)
     aligned_norm[aligned_depth <= 0] = 0
     aligned_u8 = (aligned_norm * 255).astype(np.uint8)
@@ -115,7 +104,8 @@ def save_visualization(session_dir: Path, capture_idx: int, engine: AlignmentEng
             cv2.imwrite(str(session_dir / f"{prefix}_rgb.png"), rgb_bgr)
             print(f"  Saved: {prefix}_rgb.png ({rgb_bgr.shape})")
 
-            # 4. Overlay (RGB + Aligned Depth)
+            # 4. Create overlay: blend RGB and aligned depth (50% each)
+            # Resize aligned depth if it doesn't match RGB resolution
             h, w = rgb_bgr.shape[:2]
             ah, aw = aligned_colored.shape[:2]
             if (h, w) != (ah, aw):
@@ -125,6 +115,7 @@ def save_visualization(session_dir: Path, capture_idx: int, engine: AlignmentEng
                 aligned_resized = aligned_colored
                 mask = (aligned_depth > 0).astype(np.uint8)
 
+            # Blend only where depth data exists, keep original RGB elsewhere
             overlay = rgb_bgr.copy()
             mask_3ch = np.stack([mask] * 3, axis=-1)
             overlay = np.where(mask_3ch > 0,
@@ -139,6 +130,7 @@ def save_visualization(session_dir: Path, capture_idx: int, engine: AlignmentEng
 @app.post("/session/init", response_model=SessionInitResponse)
 async def session_init(request: SessionInitRequest):
     session_id = str(uuid.uuid4())[:8]
+    # Create a new alignment engine for this session
     engine = AlignmentEngine()
     engine.init_session(
         camera_characteristics=request.camera_characteristics.model_dump(),
@@ -146,7 +138,6 @@ async def session_init(request: SessionInitRequest):
         image_height=request.image_format.height,
     )
 
-    # セッション用ディレクトリ作成
     session_dir = OUTPUT_DIR / session_id
     session_dir.mkdir(exist_ok=True)
 
@@ -170,7 +161,7 @@ async def capture(
     hmd_poses: str = Form(...),
     rgb_image: UploadFile = File(None),
 ):
-    """キャプチャデータを受け取り、RGB-Depthアライメントを実行し、可視化を保存"""
+    """Receive capture data, run RGB-Depth alignment, and save visualization."""
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -180,6 +171,7 @@ async def capture(
 
     print(f"\n--- Capture {capture_idx} (session {session_id}) ---")
 
+    # Parse depth descriptor JSON string into DepthDescriptor object
     try:
         desc = DepthDescriptor(**json.loads(depth_descriptor))
     except Exception as e:
@@ -206,10 +198,10 @@ async def capture(
 
     print(f"  Depth range: [{depth_array.min():.4f}, {depth_array.max():.4f}]")
 
-    # HMDポーズ設定
+    # Set HMD poses in the alignment engine for interpolation
     engine.set_hmd_poses([p.model_dump() for p in poses])
 
-    # Depthタイムスタンプに最も近いHMDポーズを補間で取得
+    # Interpolate HMD pose at the exact depth capture timestamp
     pose = engine.interpolator.interpolate_pose(desc.timestamp_ms)
     if pose is None:
         raise HTTPException(status_code=400, detail="Cannot interpolate HMD pose")
@@ -230,25 +222,25 @@ async def capture(
     filled_coverage = np.count_nonzero(filled) / (engine.img_w * engine.img_h) * 100
     print(f"  Coverage: {coverage:.1f}% (after fill: {filled_coverage:.1f}%)")
 
-    # RGB読み込み
+    # Initialize RGB data as None (optional field)
     rgb_bytes_data = None
     if rgb_image is not None:
         rgb_bytes_data = await rgb_image.read()
         if len(rgb_bytes_data) > 0:
             print(f"  RGB: {len(rgb_bytes_data)} bytes")
-            # YUV_420_888 の正しいサイズ: w * h * 1.5 = 1280*1280*1.5 = 2457600
-            # 実際は padding で 3276798 バイト程度
-            # 壊れたフレームは保存しない
-            expected_min = engine.img_w * engine.img_h  # 最低でもY planeサイズ以上
+            # YUV_420_888 theoretical size: w * h * 1.5 = 1280*1280*1.5 = 2,457,600 bytes
+            # Actual size may be larger (~3,276,798) due to hardware padding
+            # Reject corrupt frames below minimum expected size
+            expected_min = engine.img_w * engine.img_h  # Minimum: Y plane size only
             if len(rgb_bytes_data) >= expected_min:
-                session["latest_rgb"] = rgb_bytes_data
+                session["latest_rgb"] = rgb_bytes_data  # Save for analyze endpoint
             else:
                 print(f"  RGB: Skipping corrupt frame ({len(rgb_bytes_data)} < {expected_min})")
                 rgb_bytes_data = None
         else:
             rgb_bytes_data = None
 
-    # 可視化保存
+    # Save debug visualization images (RGB, depth, overlay)
     save_visualization(
         session_dir=session["dir"],
         capture_idx=capture_idx,
@@ -258,6 +250,7 @@ async def capture(
         aligned_depth=filled,
     )
 
+    # Increment capture counter for next filename (cap000 → cap001)
     session["capture_count"] += 1
     session["captures"].append({
         "timestamp_ms": desc.timestamp_ms,
@@ -265,6 +258,7 @@ async def capture(
         "filled_coverage": filled_coverage,
     })
 
+    # Append capture summary to history
     return CaptureResponse(
         aligned=True,
         coverage=round(coverage, 1),

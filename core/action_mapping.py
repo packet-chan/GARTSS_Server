@@ -26,9 +26,6 @@ ACTION_MAP: dict[str, dict] = {
         "arrow_length_m": 0.15,
         "label_ja": "トレーを手前に引き出す",
         "label_en": "Pull the drip tray toward you",
-        # トレーは上面＋前面の2面構造。
-        # BBoxが上にずれがちなので、下方向に大きくマージンを取り前面もカバーする。
-        # 上方向は小さくしてノズル付近を含めない。
         "sam_margin_ratios": {"top": 0.05, "bottom": 0.35, "left": 0.05, "right": 0.05},
     },
     "water_tank": {
@@ -44,7 +41,6 @@ ACTION_MAP: dict[str, dict] = {
         "arrow_length_m": 0.05,
         "label_ja": "ダイヤルを時計回りに回す",
         "label_en": "Turn the knob clockwise",
-        # ノブはタイトにセグメンテーションしたい
         "sam_margin_ratios": {"top": 0.08, "bottom": 0.08, "left": 0.08, "right": 0.08},
     },
     "power_button": {

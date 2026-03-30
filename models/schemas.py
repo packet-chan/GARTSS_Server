@@ -1,5 +1,3 @@
-"""Pydantic スキーマ"""
-
 from pydantic import BaseModel, Field
 from typing import Optional
 
@@ -55,7 +53,6 @@ class DepthDescriptor(BaseModel):
 
 
 class HMDPose(BaseModel):
-    """PoseInterpolatorと同じフィールド名を使用"""
     timestamp_ms: int
     pos_x: float
     pos_y: float
@@ -83,7 +80,6 @@ class AnalyzeRequest(BaseModel):
 
 
 class SurfaceInfo(BaseModel):
-    """サーフェス法線と操作方向の情報"""
     centroid_3d: list[float]                          # [x, y, z] Unity座標
     normal: list[float]                               # [nx, ny, nz] 単位法線ベクトル
     action_direction: list[float]                     # [dx, dy, dz] 操作方向ベクトル
@@ -101,8 +97,7 @@ class DetectedObject(BaseModel):
     center_3d: Optional[list[float]] = None
     depth_m: Optional[float] = None
     ar_placement: Optional[dict] = None
-    surface_info: Optional[SurfaceInfo] = None        # ← 追加
-
+    surface_info: Optional[SurfaceInfo] = None
 
 class AnalyzeResponse(BaseModel):
     objects: list[DetectedObject] = []

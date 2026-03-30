@@ -34,8 +34,6 @@ class BBoxResult:
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # タスクごとの親オブジェクトと検出ヒント
-# Gemini の視覚認識能力に任せる方針: hints は最小限に。
-# 過剰な指示はモデルの判断を歪めるリスクがある。
 TASK_CONTEXT = {
     "drip_tray": {
         "parent": "coffee machine",
